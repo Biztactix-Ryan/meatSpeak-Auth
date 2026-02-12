@@ -7,7 +7,7 @@
 - [DNS-RECORDS-SPEC.md](DNS-RECORDS-SPEC.md) — Normative reference for all DNS record types, field tables, encoding rules, zone file examples
 - [RECOVERY-SPEC.md](RECOVERY-SPEC.md) — Recovery contacts, account state model, recovery scenarios, key storage layers
 
-**Changes from v0.3:** Split monolithic spec into three focused documents. Core spec retains day-to-day identity operations. Recovery scenarios expanded with edge cases and UX guidance (see RECOVERY-SPEC). DNS record formats expanded with full field tables, zone file examples, and HTTPS JSON formats (see DNS-RECORDS-SPEC).
+**Changes from v0.3:** Split monolithic spec into three focused documents. Core spec retains day-to-day identity operations. Recovery scenarios expanded with edge cases and UX guidance (see RECOVERY-SPEC). DNS record formats expanded with full field tables, zone file examples, and HTTPS JSON formats (see DNS-RECORDS-SPEC). Added sealed box encryption for metadata privacy: encrypted device names, opaque device key IDs, blind RCIDs for recovery contact privacy, encrypted RC friendly names.
 
 **Changes from v0.2:** Added root key / device key hierarchy, device management, recovery contacts, social recovery, social death, account state model.
 
@@ -71,7 +71,9 @@ All entities use the same UID format, key format, DNS layout, and verification f
 
 ### 2.2 Device Keys
 
-- Per-device Ed25519 keypairs, published in DNS with `device=<name>` and `enroll_sig=<sig>`
+- Per-device Ed25519 keypairs, published in DNS with `device=<sealed-box>` and `enroll_sig=<sig>`
+- The `device` field is an **encrypted device name** — a sealed box encrypted to the user's root public key (Ed25519→X25519). Only the root key holder can decrypt to see the human-readable name (e.g., "ryan-desktop"). Observers see an opaque blob.
+- Device key IDs (`kid`) MUST be opaque (e.g., first 8 hex chars of `BLAKE2b(pk)`) — descriptive names like `desktop-2026` leak device information.
 - Used for all authentication (mutual auth, SSO challenge-response, etc.)
 - Each device key is independently revocable without affecting other devices
 - Clients performing authentication use device keys, never root key
@@ -95,13 +97,15 @@ All entities use the same UID format, key format, DNS layout, and verification f
 ```
 Root Key (offline, flag=root, from BIP-39 seed)
   |
-  +-- Signs --> Device Key: "ryan-desktop" (daily auth)
-  +-- Signs --> Device Key: "ryan-phone" (daily auth)
-  +-- Signs --> Device Key: "ryan-laptop" (daily auth)
+  +-- Signs --> Device Key: kid=a7f3b2c1, device=SealedBox("ryan-desktop")
+  +-- Signs --> Device Key: kid=e9d4f8a0, device=SealedBox("ryan-phone")
+  +-- Signs --> Device Key: kid=b2e5c9d3, device=SealedBox("ryan-laptop")
   |
-  +-- Signs --> Recovery contact designations
+  +-- Signs --> Recovery contact designations (blind RCIDs)
   +-- Signs --> Recovery contact changes
   +-- Signs --> Domain migration statements
+  |
+  +-- Decrypts (via X25519) --> Encrypted device names, RC friendly names
 ```
 
 ---
@@ -113,15 +117,17 @@ All identity records live under a configurable **identity domain**, e.g. `id.exa
 | Record Type | DNS Label | Purpose | Key Fields |
 |-------------|-----------|---------|------------|
 | Identity Provider | `_idp.<domain>` | Discover SSO issuer and JWKS | `issuer`, `jwks` |
-| Entity Key | `<uid>._k.<domain>` | Publish root and device keys | `k`, `kid`, `pk`, `flag`, `device`, `enroll_sig` |
+| Entity Key | `<uid>._k.<domain>` | Publish root and device keys | `k`, `kid`, `pk`, `flag`, `device` (sealed box), `enroll_sig` |
 | Server Self-Key | `_k.<server-domain>` | Dual-source trust anchor | `k`, `kid`, `pk`, `uid` |
 | Handle | `<handle>._h.<domain>` | Map human name to UID | `uid` |
 | Migration | `<uid>._m.<domain>` | Redirect to new identity domain | `to`, `ts`, `sig` |
-| Recovery Contact | `<uid>._rc.<domain>` | Designate social recovery contact | `rc`, `sig`, `window` |
-| RC Change | `<uid>._rcc.<domain>` | Pending recovery contact change | `old_rc`, `new_rc`, `effective`, `sig` |
-| Account State | `<uid>._s.<domain>` | Signal non-stable account state | `state`, `by`, `ts`, `expires` |
+| Recovery Contact | `<uid>._rc.<domain>` | Designate social recovery contact (blind RCID) | `rcid` (sealed box), `name` (sealed box), `window`, `death_window` |
+| RC Change | `<uid>._rcc.<domain>` | Pending recovery contact change | `old_rcid`, `new_rcid`, `new_name`, `effective`, `sig` |
+| Account State | `<uid>._s.<domain>` | Signal non-stable account state | `state`, `ts`, `expires`, `sig` |
 
 **Total DNS records per user: 2-5 TXT** (root key + device key(s) + optional recovery contact + optional state). **Per server: 2-3 TXT.**
+
+**Privacy model:** Device names and recovery contact identities are hidden behind sealed box encryption. Device `kid` fields are opaque fingerprints. The `_rc` record contains a blind RCID — only the designated RC can decrypt it to prove their status. See [DNS-RECORDS-SPEC.md §1.5](DNS-RECORDS-SPEC.md#15-sealed-box-encryption-ed25519-to-x25519) for the sealed box mechanism.
 
 ---
 
@@ -293,24 +299,29 @@ The SSO is **stateless with respect to identity**:
 1.  Client generates ULID -> uid
 2.  Client generates root Ed25519 keypair (from BIP-39 seed) -> (root_private, root_public)
 3.  Client generates first device Ed25519 keypair -> (device_private, device_public)
-4.  Root key signs device enrollment:
+4.  Client computes opaque device key ID:
+      device_kid = hex(BLAKE2b(device_public_key))[0:8]   (e.g., "a7f3b2c1")
+5.  Root key signs device enrollment:
       enroll_sig = Sign(root_key, "enroll"|uid|device_kid|device_pk|timestamp)
-5.  Client generates cold backup string (encodes root private key)
+6.  Client encrypts device name for DNS (sealed box to root public key):
+      encrypted_device_name = SealedBox(root_x25519_pk, "ryan-desktop")
+      See DNS-RECORDS-SPEC.md §3.4 for encrypted device name format
+7.  Client generates cold backup string (encodes root private key)
       See RECOVERY-SPEC.md §2.4 for cold backup format
-6.  Client derives encryption key from user's password via Argon2id
-7.  Client encrypts device_private_key -> encrypted_blob
+8.  Client derives encryption key from user's password via Argon2id
+9.  Client encrypts device_private_key -> encrypted_blob
       See RECOVERY-SPEC.md §2.3 for encrypted backup format
-8.  Client sends to SSO:
-      { uid, root_public_key, device_public_key, enroll_sig, device_name,
-        encrypted_blob, salt, argon2_params }
-9.  SSO publishes to DNS:
-      Root key:   <uid>._k.<domain> TXT "v=1;k=ed25519;kid=<kid>;pk=<root_pk>;flag=root"
-      Device key: <uid>._k.<domain> TXT "v=1;k=ed25519;kid=<kid>;pk=<device_pk>;device=<name>;enroll_sig=<sig>"
+10. Client sends to SSO:
+      { uid, root_public_key, device_public_key, device_kid, enroll_sig,
+        encrypted_device_name, encrypted_blob, salt, argon2_params }
+11. SSO publishes to DNS:
+      Root key:   <uid>._k.<domain> TXT "v=1;k=ed25519;kid=root-2026;pk=<root_pk>;flag=root"
+      Device key: <uid>._k.<domain> TXT "v=1;k=ed25519;kid=a7f3b2c1;pk=<device_pk>;device=<sealed-box>;enroll_sig=<sig>"
       See DNS-RECORDS-SPEC.md §3 for full record format
-10. Client stores device private key in device keychain
-11. Client prompts user to designate a recovery contact (optional but recommended)
+12. Client stores device private key in device keychain
+13. Client prompts user to designate a recovery contact (optional but recommended)
       See RECOVERY-SPEC.md §3 for recovery contact setup
-12. Done -- user never saw any cryptography
+14. Done -- user never saw any cryptography
 ```
 
 ### 7.2 New Server
@@ -346,7 +357,7 @@ See [DNS-RECORDS-SPEC.md §11](DNS-RECORDS-SPEC.md#11-https-fallback-endpoints) 
 
 These security considerations cover core operational threats. See [RECOVERY-SPEC.md §5-7](RECOVERY-SPEC.md) for recovery-specific threats and [DNS-RECORDS-SPEC.md §12](DNS-RECORDS-SPEC.md#12-security-considerations) for DNS-specific threats.
 
-**DNS is not private.** Public keys are public. Do not store sensitive data in DNS.
+**DNS is public, but metadata can be private.** Public keys are public by design. However, sensitive metadata is protected by sealed box encryption (Ed25519→X25519): device names are opaque, recovery contact identities are hidden behind blind RCIDs, and RC friendly names are encrypted. Only the designated key holder can decrypt. See [DNS-RECORDS-SPEC.md §1.5](DNS-RECORDS-SPEC.md#15-sealed-box-encryption-ed25519-to-x25519).
 
 **DNSSEC recommended** but not required. Without DNSSEC, network attackers could spoof DNS. The HTTPS fallback (TLS) and dual-source verification provide alternative trust paths.
 
@@ -372,6 +383,8 @@ These security considerations cover core operational threats. See [RECOVERY-SPEC
 |-------------------|---------------------------------------------|
 | ULID generation   | `Cysharp/Ulid`                              |
 | Ed25519           | `NSec.Cryptography` or `libsodium-net`      |
+| X25519 / Sealed box | `libsodium-net` (`crypto_box_seal`, `crypto_sign_ed25519_pk_to_curve25519`) |
+| BLAKE2b           | `libsodium-net` (for opaque device key IDs) |
 | Argon2id          | `Konscious.Security.Cryptography` or `libsodium-net` |
 | AES-256-GCM       | `System.Security.Cryptography.AesGcm`       |
 | DNS resolution    | `DnsClient.NET`                             |
@@ -416,7 +429,7 @@ Explicitly out of scope to keep ops costs near zero:
 - Profiles, avatars, display names — optional HTTPS / plugins
 - Discovery / friend search — invite codes, QR, optional directory servers
 - OAuth / OIDC sessions — layer on top; this spec provides key material
-- Private messaging key exchange — future extension (X25519)
+- Private messaging key exchange — future extension (X25519 is already used for sealed box encryption; DH key exchange is a separate concern)
 - Payments, reputation, moderation — application-layer concerns
 - Access control / permissions — server-side policy, not identity-layer
 

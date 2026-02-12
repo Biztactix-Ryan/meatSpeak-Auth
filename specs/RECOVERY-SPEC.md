@@ -6,6 +6,8 @@
 
 This document covers what happens when things go wrong: lost devices, lost keys, compromised keys, and permanent account termination. Each recovery scenario gets its own section with step-by-step flows, edge cases, and security analysis.
 
+Recovery contact relationships are privacy-protected using **blind RCIDs** — sealed box encryption that hides the RC's identity from DNS observers. The RC proves their status by decrypting the sealed box at recovery time. See [DNS-RECORDS-SPEC.md §7](DNS-RECORDS-SPEC.md#7-recovery-contact-_rc) for the cryptographic details.
+
 ---
 
 ## 1. Overview
@@ -155,7 +157,9 @@ Encoded: Base58Check (with 4-byte checksum)
 
 ### 3.1 What Is a Recovery Contact
 
-A recovery contact is another user in the system (identified by their UID) whom you trust to help you recover your identity if you lose all your keys. Think of it like an emergency contact on a medical form — someone who can vouch for your identity through an out-of-band channel (phone call, in-person meeting).
+A recovery contact is another user in the system whom you trust to help you recover your identity if you lose all your keys. Think of it like an emergency contact on a medical form — someone who can vouch for your identity through an out-of-band channel (phone call, in-person meeting).
+
+**Privacy:** Recovery contact relationships are hidden in DNS using **blind RCIDs** — sealed box encryption that conceals the RC's identity from everyone except the RC themselves and the user (who can decrypt the friendly name). The identity server does not know who your recovery contact is until recovery is actually triggered. Even the RC cannot see who else is designated. See [DNS-RECORDS-SPEC.md §7](DNS-RECORDS-SPEC.md#7-recovery-contact-_rc) for the cryptographic details.
 
 Recovery contacts can:
 - Co-sign a root key rotation (when you have a working device but lost your root key).
@@ -166,20 +170,30 @@ Recovery contacts **cannot**:
 - Access your private keys.
 - Authenticate as you.
 - Silently take over your identity (grace periods and cancellation mechanisms prevent this).
+- Determine who else is designated as a recovery contact for the same user.
 
 ### 3.2 Designating a Recovery Contact
 
-A user designates another UID as their recovery contact, signed by their root key. The designation is published as a DNS record.
+A user designates another user as their recovery contact by creating a **blind RCID** — a sealed box containing the root key's authorization signature, encrypted to the RC's public key. The designation is published as a DNS record.
 
 **Abbreviated record** (see [DNS-RECORDS-SPEC.md §7](DNS-RECORDS-SPEC.md#7-recovery-contact-_rc) for full field table):
 ```
-<uid>._rc.<domain>  TXT  "v=1;rc=<recovery-uid>;sig=<base64url>;window=14d;death_window=60d"
+<uid>._rc.<domain>  TXT  "v=1;rcid=<base64url>;name=<base64url>;window=14d;death_window=60d"
 ```
 
-- `sig` = `Sign(root_key, "recover"|uid|recovery_uid|window|death_window|timestamp)`
+**RCID construction:**
+1. User knows the RC's Ed25519 public key.
+2. Root key signs authorization: `auth_sig = Sign(root_key, "recover" || uid || rc_pk || window || death_window || timestamp)`
+3. Seal to the RC's X25519 public key: `rcid = SealedBox(rc_x25519_pk, auth_sig)`
+4. Optionally encrypt a friendly name: `name = SealedBox(user_root_x25519_pk, "Tara")`
+
+- `rcid` = sealed box containing the root key's authorization signature, encrypted to the RC's public key. Only the RC can decrypt.
+- `name` = sealed box containing a friendly name for the RC, encrypted to the user's root public key. Only the user can decrypt.
 - `window` = waiting period for recovery operations (default 14d)
 - `death_window` = waiting period for death declaration (default 60d)
 - Multiple recovery contacts allowed (future: M-of-N threshold, see §9)
+
+**What an observer sees:** An opaque `rcid` blob and an opaque `name` blob. No UID, no public key, no identifiable information about the recovery contact.
 
 ### 3.3 Changing a Recovery Contact
 
@@ -187,8 +201,10 @@ Changing recovery contacts has a mandatory **7-day waiting period**. This preven
 
 **Abbreviated record** (see [DNS-RECORDS-SPEC.md §8](DNS-RECORDS-SPEC.md#8-recovery-contact-change-_rcc) for full field table):
 ```
-<uid>._rcc.<domain>  TXT  "v=1;old_rc=<old-uid>;new_rc=<new-uid>;ts=<timestamp>;effective=<timestamp+7d>;sig=<base64url>"
+<uid>._rcc.<domain>  TXT  "v=1;old_rcid=<base64url>;new_rcid=<base64url>;new_name=<base64url>;ts=<timestamp>;effective=<timestamp+7d>;sig=<base64url>"
 ```
+
+The `old_rcid` matches the existing `_rc` record's `rcid` value. The `new_rcid` is a fresh sealed box for the replacement RC. The server identifies which RC is being replaced by matching the `old_rcid` value — no UIDs are involved.
 
 ### 3.4 The 7-Day Change Delay
 
@@ -197,19 +213,19 @@ Changing recovery contacts has a mandatory **7-day waiting period**. This preven
 - Long enough that the real owner or existing recovery contact will likely notice.
 
 **During the 7-day period:**
-- BOTH old and new recovery contacts are notified (identity server sends challenge to both).
-- Old recovery contact can raise an alarm (flag the change as suspicious).
+- The user notifies both old and new recovery contacts **out-of-band** (the identity server does not know their identities due to blind RCIDs).
+- The old RC can detect the pending change by checking for `_rcc` records and recognizing their `old_rcid` value.
 - Any device key OR root key can cancel the change.
 - The old recovery contact retains full recovery powers until the change takes effect.
 
-**After 7 days:** New recovery contact record replaces old one.
+**After 7 days:** The `_rc` record matching `old_rcid` is replaced with a new record containing `new_rcid` and `new_name`. The `_rcc` record is removed.
 
 **Attack scenario walkthrough:**
 
 1. Attacker compromises Alice's root key.
-2. Attacker publishes a recovery contact change: swap Tara (real RC) for Mallory (attacker's accomplice).
-3. Day 0: `_rcc` record published. Both Tara and Mallory are notified.
-4. Day 1-2: Tara sees the notification and calls Alice. Alice didn't request this.
+2. Attacker publishes a recovery contact change: swap Tara (real RC) for Mallory (attacker's accomplice). The `_rcc` record appears in DNS.
+3. Day 0: `_rcc` record published. Tara, monitoring `_rcc` records for Alice, detects the pending change by recognizing her `old_rcid`.
+4. Day 1-2: Tara calls Alice. Alice didn't request this.
 5. Day 2: Alice uses any device key to cancel the change.
 6. Result: Attack foiled. Without the 7-day delay, Mallory would have been active as RC before anyone noticed.
 
@@ -308,7 +324,7 @@ The user can still authenticate day-to-day (device keys work), but cannot perfor
 
 1. **User initiates:** Publishes a root rotation request signed with their device key.
 2. **Out-of-band verification:** User contacts recovery contact through a separate channel (phone call, in-person meeting) to confirm the request is legitimate.
-3. **RC co-signs:** Recovery contact verifies the request and co-signs with their own key.
+3. **RC proves authorization:** Recovery contact fetches the user's `_rc` records, decrypts the sealed box RCID with their private key to extract the root authorization signature, then presents their public key + the authorization signature + a signed request to the identity server. The server verifies both the root key authorization and the RC's key ownership. See [DNS-RECORDS-SPEC.md §7.4](DNS-RECORDS-SPEC.md#74-rc-verification-flow) for the full verification flow.
 4. **State change:** Identity server sets account state to `root_rotation` with the configured grace period (default 14 days).
 5. **Grace period:** All existing device keys remain active. Daily operations continue normally.
 6. **Grace period expires (no cancellation):**
@@ -333,9 +349,16 @@ User (device key)        Recovery Contact          Identity Server
   | "I need to rotate my root"|                            |
   |~~~~ ~~~~ ~~~~ ~~~~ ~~~~>  |                            |
   |                           |                            |
-  |                           | Co-sign rotation           |
-  |                           | sig=Sign(rc_key,...)       |
+  |                           | Fetch _rc records          |
+  |                           | Decrypt RCID (sealed box)  |
+  |                           | -> extract root auth sig   |
+  |                           |                            |
+  |                           | Present: my_pk + root_sig  |
+  |                           | + Sign(rc_key, request)    |
   |                           |--------------------------->|
+  |                           |                            |
+  |                           |  Verify root_sig (RC auth) |
+  |                           |  Verify rc_key (ownership) |
   |                           |                            |
   |                     State -> root_rotation              |
   |                     Grace period: 14 days               |
@@ -411,7 +434,7 @@ Common causes:
 ### 6.3 Step-by-Step Flow
 
 1. **Out-of-band contact:** User contacts recovery contact through a non-digital channel (phone call, in-person).
-2. **RC initiates:** Recovery contact publishes a full recovery request signed with their own key.
+2. **RC proves authorization and initiates:** Recovery contact fetches the user's `_rc` records, decrypts the RCID sealed box to extract the root authorization signature, then presents their public key + authorization signature + signed recovery request. The server verifies both proofs. See [DNS-RECORDS-SPEC.md §7.4](DNS-RECORDS-SPEC.md#74-rc-verification-flow).
 3. **State change:** Identity server sets account state to `full_recovery`.
 4. **Device keys contested:** All existing device keys are marked `contested` in DNS.
 5. **Grace period (14 days):** Only the root key can cancel. If the user actually has the root key, the "lost everything" claim was false.
@@ -434,9 +457,16 @@ User (no keys)           Recovery Contact          Identity Server
   | "I've lost everything"    |                            |
   |~~~~ ~~~~ ~~~~ ~~~~ ~~~~>  |                            |
   |                           |                            |
-  |                           | Initiate full recovery     |
-  |                           | sig=Sign(rc_key,...)       |
+  |                           | Fetch _rc records          |
+  |                           | Decrypt RCID (sealed box)  |
+  |                           | -> extract root auth sig   |
+  |                           |                            |
+  |                           | Present: my_pk + root_sig  |
+  |                           | + Sign(rc_key, request)    |
   |                           |--------------------------->|
+  |                           |                            |
+  |                           |  Verify root_sig (RC auth) |
+  |                           |  Verify rc_key (ownership) |
   |                           |                            |
   |                     State -> full_recovery              |
   |                     All device keys -> contested        |
@@ -532,7 +562,7 @@ This is NOT for:
 ### 7.3 Step-by-Step Flow
 
 1. **RC decides to act:** Recovery contact determines (through real-world information) that the user is permanently gone.
-2. **RC initiates:** Recovery contact publishes a death declaration signed with their own key.
+2. **RC proves authorization and initiates:** Recovery contact fetches the user's `_rc` records, decrypts the RCID sealed box to extract the root authorization signature, then presents their public key + authorization signature + signed death declaration. The server verifies both proofs. See [DNS-RECORDS-SPEC.md §7.4](DNS-RECORDS-SPEC.md#74-rc-verification-flow).
 3. **State change:** Identity server sets account state to `death`.
 4. **Grace period (60 days):** Existing sessions continue. No new device enrollments. The `death` state is visible to all relying parties.
 5. **Grace period expires (no cancellation):**
@@ -547,9 +577,16 @@ This is NOT for:
 ```
                          Recovery Contact          Identity Server
                               |                            |
-                              | Initiate death declaration |
-                              | sig=Sign(rc_key,...)       |
+                              | Fetch _rc records          |
+                              | Decrypt RCID (sealed box)  |
+                              | -> extract root auth sig   |
+                              |                            |
+                              | Present: my_pk + root_sig  |
+                              | + Sign(rc_key, death_decl) |
                               |--------------------------->|
+                              |                            |
+                              |  Verify root_sig (RC auth) |
+                              |  Verify rc_key (ownership) |
                               |                            |
                         State -> death                     |
                         60-day grace period                 |
@@ -659,9 +696,9 @@ Device key rotation is a routine maintenance operation. Root key rotation is an 
 
 ## 9. Future: M-of-N Threshold Recovery
 
-The current system supports a single recovery contact per account. A future enhancement will support **M-of-N threshold recovery**, where:
+The current system supports multiple recovery contact records per account. A future enhancement will support **M-of-N threshold recovery**, where:
 
-- A user designates N recovery contacts.
+- A user designates N recovery contacts (each as a separate `_rc` record with a blind RCID).
 - Any M of them (where M <= N) must agree to initiate recovery.
 - This reduces the risk of a single compromised or malicious recovery contact.
 
@@ -670,10 +707,16 @@ The current system supports a single recovery contact per account. A future enha
 - M = ceil(N/2) + 1 (strict majority) for full recovery and social death.
 - M = 1 for root key rotation (less destructive, lower threshold appropriate).
 
+**Privacy properties of M-of-N with blind RCIDs:**
+- Each RC has their own sealed box RCID — they can only identify their own record by attempting decryption.
+- RCs cannot determine who else is designated, or how many total RCs exist (they see N opaque records but can only decrypt one).
+- The user can identify each RC via the encrypted `name` field (decryptable with root key).
+- The identity server only learns an RC's identity when they present their authorization during recovery.
+
 **Open questions:**
 - How to handle partial signatures (some RCs sign, others don't respond within a time window).
 - Whether different operations should have different thresholds.
-- DNS record format for multiple recovery contacts.
+- Coordination mechanism for multiple RCs to independently authorize without revealing each other's identity.
 
 This section is forward-looking and not yet normative.
 
@@ -720,11 +763,11 @@ START: "I need to recover my identity"
 
 ## Appendix B: Recovery DNS Records Quick Reference
 
-| Record | Label | Purpose | Published During |
-|--------|-------|---------|-----------------|
-| Recovery Contact | `<uid>._rc.<domain>` | Designate trusted recovery contact | Stable state (always present if set) |
-| RC Change | `<uid>._rcc.<domain>` | Pending recovery contact change | 7-day change window |
-| Account State | `<uid>._s.<domain>` | Signal recovery state | Any non-stable state |
-| Tombstone | `<uid>._s.<domain>` | Permanent death marker | After social death completes |
+| Record | Label | Key Fields | Purpose |
+|--------|-------|-----------|---------|
+| Recovery Contact | `<uid>._rc.<domain>` | `rcid` (sealed box), `name` (sealed box), `window`, `death_window` | Designate trusted RC (blind — identity hidden) |
+| RC Change | `<uid>._rcc.<domain>` | `old_rcid`, `new_rcid`, `new_name`, `effective`, `sig` | Pending RC change (7-day waiting period) |
+| Account State | `<uid>._s.<domain>` | `state`, `ts`, `expires`, `sig` | Signal recovery state (no `by` field — initiator identity protected) |
+| Tombstone | `<uid>._s.<domain>` | `state=tombstone`, `ts` | Permanent death marker |
 
 See [DNS-RECORDS-SPEC.md](DNS-RECORDS-SPEC.md) for full field tables and examples.

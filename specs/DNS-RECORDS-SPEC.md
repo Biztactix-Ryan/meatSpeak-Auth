@@ -18,7 +18,7 @@ All identity records live under a configurable **identity domain**, e.g. `id.exa
 
 | Encoding | Used For | Rules |
 |----------|----------|-------|
-| Base64url | Public keys, signatures, ciphertext | [RFC 4648 §5](https://datatracker.ietf.org/doc/html/rfc4648#section-5). No padding (`=`). Alphabet: `A-Za-z0-9-_`. |
+| Base64url | Public keys, signatures, ciphertext, sealed boxes | [RFC 4648 §5](https://datatracker.ietf.org/doc/html/rfc4648#section-5). No padding (`=`). Alphabet: `A-Za-z0-9-_`. |
 | ISO 8601 | Timestamps | UTC, full precision: `YYYY-MM-DDTHH:MM:SSZ`. Always include the `Z` suffix. |
 | Crockford Base32 | UIDs (ULID) | 26 characters, lowercase in DNS labels. Alphabet: `0-9a-hjkmnp-tv-z`. |
 | Duration | Window fields | Integer followed by unit: `d` (days), `h` (hours). Example: `14d`, `60d`. |
@@ -33,13 +33,13 @@ DNS TXT records are composed of one or more character strings, each with a maxim
 - Resolvers concatenate the strings in order to reconstruct the full value.
 - Implementations MUST handle concatenation transparently.
 
-In practice, most identity records fit within a single 255-byte string. Key records with enrollment signatures may require two strings.
+In practice, most identity records fit within a single 255-byte string. Key records with enrollment signatures and encrypted device names may require two strings.
 
 **Example (multi-string TXT record):**
 ```
 <uid>._k.id.example.org.  3600  IN  TXT
-  "v=1;k=ed25519;kid=desktop-2026;pk=dGhpcyBpcyBhIGZha2Uga2V5IGJ1dCBpdCBk"
-  "ZW1vbnN0cmF0ZXMgbXVsdGktc3RyaW5n;device=ryan-desktop;enroll_sig=BASE64URL..."
+  "v=1;k=ed25519;kid=a7f3b2c1;pk=dGhpcyBpcyBhIGZha2Uga2V5IGJ1dCBpdCBk"
+  "ZW1vbnN0cmF0ZXMgbXVsdGktc3RyaW5n;device=<sealed-box>;enroll_sig=BASE64URL..."
 ```
 
 ### 1.4 Multi-Value Records
@@ -51,6 +51,28 @@ Resolvers querying a label receive all TXT records. Implementations MUST:
 1. Parse each TXT record independently.
 2. Use the `flag`, `kid`, and `device` fields to distinguish records.
 3. Not assume any ordering of returned records.
+
+### 1.5 Sealed Box Encryption (Ed25519 to X25519)
+
+Several record types use **sealed box encryption** to protect metadata from DNS observers while allowing specific key holders to decrypt. This uses the Ed25519-to-X25519 key conversion available in libsodium.
+
+**How it works:**
+1. Convert the recipient's Ed25519 public key to X25519: `recipient_x25519_pk = crypto_sign_ed25519_pk_to_curve25519(ed25519_pk)`
+2. Encrypt: `sealed = crypto_box_seal(plaintext, recipient_x25519_pk)`
+3. Encode the sealed box as Base64url for storage in DNS.
+
+**Decryption** (requires the recipient's private key):
+1. Convert Ed25519 keypair to X25519: `x25519_sk = crypto_sign_ed25519_sk_to_curve25519(ed25519_sk)`
+2. Decrypt: `plaintext = crypto_box_seal_open(sealed, x25519_pk, x25519_sk)`
+
+**Overhead:** Sealed box adds 48 bytes (32-byte ephemeral public key + 16-byte MAC). A 20-byte plaintext becomes 68 bytes raw / ~91 chars Base64url.
+
+**Two encryption patterns are used throughout this spec:**
+
+| Pattern | Encrypt To | Purpose | Decrypted By |
+|---------|-----------|---------|-------------|
+| **Owner-readable** | User's root public key | Encrypted device names, RC friendly names | User (with root key) |
+| **Recipient-readable** | Recipient's public key | RC authorization (RCID) | Designated recovery contact |
 
 ---
 
@@ -104,13 +126,13 @@ _idp.id.example.org.  3600  IN  TXT  "v=1;issuer=https://id.example.org;jwks=/au
 |--------------|----------|-------------|-------------|
 | `v`          | Yes      | Integer     | Spec version. Currently `1`. |
 | `k`          | Yes      | String      | Key algorithm. MUST be `ed25519`. |
-| `kid`        | Yes      | String      | Key identifier. Recommended format: `YYYY-MM` or short slug (e.g., `root-2026`, `desktop-2026`). |
+| `kid`        | Yes      | String      | Key identifier. For device keys: MUST be opaque (e.g., first 8 hex chars of `BLAKE2b(pk)`). For root keys: MAY use `root-YYYY` format. See §3.5. |
 | `pk`         | Yes      | Base64url   | Ed25519 public key (32 bytes encoded). |
 | `exp`        | No       | ISO 8601    | Expiry hint. Advisory only — implementations SHOULD warn but MAY still accept. |
-| `flag`       | No       | String      | Comma-separated flags. See §3.4. |
+| `flag`       | No       | String      | Comma-separated flags. See §3.5. |
 | `type`       | No       | String      | Entity type: `user`, `server`, `idp`. Default: `user`. |
-| `device`     | No       | String      | Human-readable device name (e.g., `ryan-desktop`). Only for device keys. |
-| `enroll_sig` | No       | Base64url   | Root key signature authorizing this device key. Only for device keys. See §3.6. |
+| `device`     | No       | Base64url   | **Sealed box** containing the human-readable device name, encrypted to the user's root X25519 public key. Only for device keys. See §3.4. |
+| `enroll_sig` | No       | Base64url   | Root key signature authorizing this device key. Only for device keys. See §3.7. |
 
 ### 3.3 Root Key Records
 
@@ -120,6 +142,7 @@ Root keys are published with `flag=root`. They represent the identity anchor.
 - One root key per UID at any time (during rotation, the old key is revoked before the new one is published).
 - MUST NOT be used for authentication — only for signing management operations.
 - Management operations signed by root key: device enrollment, device revocation, recovery contact designation, recovery contact change, migration statements.
+- The root key also serves as the encryption key for owner-readable sealed boxes (via Ed25519-to-X25519 conversion).
 
 **Example:**
 ```
@@ -129,13 +152,25 @@ Root keys are published with `flag=root`. They represent the identity anchor.
 
 ### 3.4 Device Key Records
 
-Device keys are per-device Ed25519 keypairs used for all authentication. They include the `device` field and an `enroll_sig` proving the root key authorized them.
+Device keys are per-device Ed25519 keypairs used for all authentication. They include the `device` field (an encrypted device name) and an `enroll_sig` proving the root key authorized them.
+
+**Encrypted device name:** The `device` field contains a sealed box encrypted to the user's root public key (X25519-converted). Only the root key holder can decrypt to see the human-readable name (e.g., "ryan-desktop").
+
+```
+device = Base64url(SealedBox(root_x25519_pk, "ryan-desktop"))
+```
+
+**Why encrypt?** Plaintext device names like `device=ryan-desktop` leak information about the user's hardware and habits. Encrypted names are opaque to all observers; only the user (with their root key) can see which device is which.
+
+**Opaque key IDs:** The `kid` field for device keys MUST be opaque to prevent leaking device information through the key identifier. Recommended: first 8 hex characters of `BLAKE2b(pk)`.
 
 **Example:**
 ```
 01j5a3k7pm9qwr4txyz6bn8vhe._k.id.example.org.  3600  IN  TXT
-  "v=1;k=ed25519;kid=desktop-2026;pk=ZGV2aWNlIGtleSBnb2VzIGhlcmU;device=ryan-desktop;enroll_sig=ZW5yb2xsbWVudCBzaWduYXR1cmU"
+  "v=1;k=ed25519;kid=a7f3b2c1;pk=ZGV2aWNlIGtleSBnb2VzIGhlcmU;device=k8Tn2pFxQm4rV7jLwBs9YhD3gCeAv6RKXJ0NfMqUcWdHb5lzSoI1EiPtGyu;enroll_sig=ZW5yb2xsbWVudCBzaWduYXR1cmU"
 ```
+
+An observer sees `device=k8Tn2pFx...` (opaque) and `kid=a7f3b2c1` (opaque). They know it's a device key, but not which device.
 
 ### 3.5 Flag Values and Semantics
 
@@ -149,7 +184,15 @@ Device keys are per-device Ed25519 keypairs used for all authentication. They in
 
 Flags are comma-separated when multiple apply: `flag=primary,rotate`.
 
-A key with no `flag` field and no `device` field is treated as a user key (legacy format). Implementations SHOULD require explicit `flag=root` or `device=<name>` on all new records.
+**Key ID conventions:**
+
+| Key Type | `kid` Format | Example |
+|----------|-------------|---------|
+| Root key | `root-YYYY` or `root-YYYY-MM` | `root-2026` |
+| Device key | First 8 hex chars of `BLAKE2b(pk)` | `a7f3b2c1` |
+| Server key | `YYYY-MM` or short slug | `2026-02`, `srv-2026` |
+
+Device key IDs MUST be opaque to prevent leaking device information. Implementations MUST NOT use descriptive names like `desktop-2026` or `phone-2026` as key IDs.
 
 ### 3.6 Multiple Keys on One Label
 
@@ -157,7 +200,7 @@ Resolving `<uid>._k.<domain>` returns **all** TXT records for that label — the
 
 1. Parse each TXT record independently.
 2. Identify the root key by `flag=root`.
-3. Identify device keys by the presence of `device=<name>`.
+3. Identify device keys by the presence of `device=<sealed-box>`.
 4. Skip any record with `flag=revoked` for authentication purposes (but retain for audit/display).
 5. Not assume any particular ordering.
 
@@ -167,11 +210,13 @@ Resolving `<uid>._k.<domain>` returns **all** TXT records for that label — the
   "v=1;k=ed25519;kid=root-2026;pk=cm9vdCBrZXk;flag=root"
 
 01j5a3k7pm9qwr4txyz6bn8vhe._k.id.example.org.  3600  IN  TXT
-  "v=1;k=ed25519;kid=desktop-2026;pk=ZGVza3RvcCBrZXk;device=ryan-desktop;enroll_sig=c2lnMQ"
+  "v=1;k=ed25519;kid=a7f3b2c1;pk=ZGVza3RvcCBrZXk;device=k8Tn2pFxQm4rV7jL;enroll_sig=c2lnMQ"
 
 01j5a3k7pm9qwr4txyz6bn8vhe._k.id.example.org.  3600  IN  TXT
-  "v=1;k=ed25519;kid=phone-2026;pk=cGhvbmUga2V5;device=ryan-phone;enroll_sig=c2lnMg"
+  "v=1;k=ed25519;kid=e9d4f8a0;pk=cGhvbmUga2V5;device=Qx7mWnK4pLs8Bf2T;enroll_sig=c2lnMg"
 ```
+
+An observer sees: one root key and two device keys. They cannot determine what devices they represent.
 
 ### 3.7 Enrollment Signature Verification
 
@@ -207,23 +252,19 @@ bool VerifyEnrollment(byte[] rootPk, string uid, string deviceKid,
 
 ### 3.8 Examples
 
-**Root key only (new registration, before first device):**
-```
-01j5a3k7pm9qwr4txyz6bn8vhe._k.id.example.org.  3600  IN  TXT
-  "v=1;k=ed25519;kid=root-2026;pk=cm9vdCBrZXkgZ29lcyBoZXJl;flag=root"
-```
-
-**Root key + two devices:**
+**Root key + two devices (encrypted names):**
 ```
 01j5a3k7pm9qwr4txyz6bn8vhe._k.id.example.org.  3600  IN  TXT
   "v=1;k=ed25519;kid=root-2026;pk=cm9vdCBrZXk;flag=root"
 
 01j5a3k7pm9qwr4txyz6bn8vhe._k.id.example.org.  3600  IN  TXT
-  "v=1;k=ed25519;kid=desktop-2026;pk=ZGVza3RvcCBrZXk;flag=primary;device=ryan-desktop;enroll_sig=ZW5yb2xsLWRlc2t0b3A"
+  "v=1;k=ed25519;kid=a7f3b2c1;pk=ZGVza3RvcCBrZXk;flag=primary;device=k8Tn2pFxQm4rV7jLwBs9YhD3gCeAv6RKXJ0NfMqUcWdHb5lzSoI1EiPtGyu;enroll_sig=ZW5yb2xsLWRlc2t0b3A"
 
 01j5a3k7pm9qwr4txyz6bn8vhe._k.id.example.org.  3600  IN  TXT
-  "v=1;k=ed25519;kid=phone-2026;pk=cGhvbmUga2V5;device=ryan-phone;enroll_sig=ZW5yb2xsLXBob25l"
+  "v=1;k=ed25519;kid=e9d4f8a0;pk=cGhvbmUga2V5;device=Qx7mWnK4pLs8Bf2TgVjRcY0hAv3DwZeU9rN6XoJtHi1aPkEy5CdMlGqSuO;enroll_sig=ZW5yb2xsLXBob25l"
 ```
+
+User decrypts `device` fields with root key -> sees "ryan-desktop" and "ryan-phone". Observer sees opaque blobs.
 
 **During device key rotation:**
 ```
@@ -231,10 +272,10 @@ bool VerifyEnrollment(byte[] rootPk, string uid, string deviceKid,
   "v=1;k=ed25519;kid=root-2026;pk=cm9vdCBrZXk;flag=root"
 
 01j5a3k7pm9qwr4txyz6bn8vhe._k.id.example.org.  300  IN  TXT
-  "v=1;k=ed25519;kid=desktop-2026;pk=b2xkIGRlc2t0b3Aga2V5;flag=rotate;device=ryan-desktop;enroll_sig=c2lnMQ"
+  "v=1;k=ed25519;kid=a7f3b2c1;pk=b2xkIGRlc2t0b3Aga2V5;flag=rotate;device=k8Tn2pFxQm4rV7jL;enroll_sig=c2lnMQ"
 
 01j5a3k7pm9qwr4txyz6bn8vhe._k.id.example.org.  300  IN  TXT
-  "v=1;k=ed25519;kid=desktop-2026b;pk=bmV3IGRlc2t0b3Aga2V5;flag=primary;device=ryan-desktop;enroll_sig=c2lnMg"
+  "v=1;k=ed25519;kid=b2e5c9d3;pk=bmV3IGRlc2t0b3Aga2V5;flag=primary;device=Rm8nPqLx2Ws5Tv7j;enroll_sig=c2lnMg"
 ```
 
 ---
@@ -257,7 +298,7 @@ _k.<server-domain>  TXT  "v=1;k=ed25519;kid=<key-id>;pk=<base64url>;uid=<server-
 | `pk`   | Yes      | Base64url | Ed25519 public key (32 bytes encoded). |
 | `uid`  | Yes      | ULID      | Server's UID, linking this record to the identity domain entry. |
 
-Note: The `uid` field is required here (unlike entity key records in the identity domain) because the server domain label doesn't contain the UID.
+Note: The `uid` field is required here (unlike entity key records in the identity domain) because the server domain label doesn't contain the UID. Server keys do not use encrypted device names (servers are public infrastructure).
 
 ### 4.3 Dual-Source Pattern
 
@@ -412,10 +453,12 @@ Clients MUST NOT follow migration chains longer than 3 hops (prevents infinite l
 
 ## 7. Recovery Contact (`_rc`)
 
+Recovery contact records use **blind RCIDs** — the recovery contact's identity is hidden behind sealed box encryption. No UID, public key, or identifying information about the recovery contact is visible in DNS. See [RECOVERY-SPEC.md §3](RECOVERY-SPEC.md) for the full recovery contact lifecycle.
+
 ### 7.1 Record Format
 
 ```
-<uid>._rc.<domain>  TXT  "v=1;rc=<recovery-uid>;sig=<base64url>;window=14d;death_window=60d"
+<uid>._rc.<domain>  TXT  "v=1;rcid=<base64url>;name=<base64url>;window=14d;death_window=60d"
 ```
 
 ### 7.2 Field Table
@@ -423,39 +466,93 @@ Clients MUST NOT follow migration chains longer than 3 hops (prevents infinite l
 | Field          | Required | Type      | Description |
 |----------------|----------|-----------|-------------|
 | `v`            | Yes      | Integer   | Spec version. Currently `1`. |
-| `rc`           | Yes      | ULID      | UID of the designated recovery contact. |
-| `sig`          | Yes      | Base64url | Root key signature authorizing this designation. |
+| `rcid`         | Yes      | Base64url | **Sealed box** containing the root key authorization signature, encrypted to the RC's X25519 public key. The RC decrypts this to prove their status. See §7.3. |
+| `name`         | No       | Base64url | **Sealed box** containing a human-readable name for this RC (e.g., "Tara"), encrypted to the user's root X25519 public key. Only the user can decrypt. |
 | `window`       | No       | Duration  | Waiting period for recovery operations. Default: `14d`. |
 | `death_window` | No       | Duration  | Waiting period for death declaration. Default: `60d`. |
 
-### 7.3 Signature Construction
+### 7.3 RCID Construction
+
+The `rcid` field is a sealed box containing the root key's authorization signature, encrypted to the recovery contact's public key:
 
 ```
-message = "recover" | uid | recovery_uid | window | death_window | timestamp
+authorization = Sign(root_key, "recover" || uid || rc_pk || window || death_window || timestamp)
+rcid = SealedBox(rc_x25519_pk, authorization)
 ```
 
-Where `|` is byte concatenation of raw UTF-8 strings. The `timestamp` is the time of designation (not stored in the record — the identity server records it at publication time).
+**Step-by-step (at designation time):**
+1. The user knows the RC's Ed25519 public key.
+2. Sign the authorization: `auth_sig = Sign(root_key, "recover" || uid || rc_pk || window || death_window || timestamp)`.
+3. Convert the RC's Ed25519 public key to X25519.
+4. Seal: `rcid = crypto_box_seal(auth_sig, rc_x25519_pk)`.
+5. Encode as Base64url.
 
-**Step-by-step:**
-1. Concatenate: `"recover" + uid + recovery_uid + window + death_window + timestamp` as UTF-8 bytes.
-2. Sign: `sig = Ed25519.Sign(root_private_key, message)`.
-3. Encode as Base64url.
+**What's inside the RCID:** The root key's Ed25519 signature over a message that binds the RC's public key to this user's recovery authorization. Only the RC can extract this signature.
 
-### 7.4 Examples
+### 7.4 RC Verification Flow
 
-**Standard recovery contact:**
+When a recovery contact initiates recovery, they prove their authorization:
+
+```
+RC                                         Identity Server
+  |                                              |
+  | Fetch _rc records for the user               |
+  | Try decrypting each rcid with my private key |
+  | One succeeds -> I have the root_sig          |
+  |                                              |
+  | Present: my_pk + root_sig + signed request   |
+  |--------------------------------------------->|
+  |                                              |
+  |   Server reconstructs the signed message:    |
+  |   "recover" || uid || presented_pk ||        |
+  |   window || death_window || timestamp        |
+  |                                              |
+  |   Verify(root_pk, root_sig, message) ✓       |
+  |   -> Root key authorized this pk as RC       |
+  |                                              |
+  |   Verify(presented_pk, request_sig) ✓        |
+  |   -> RC holds the corresponding private key  |
+  |                                              |
+  | Authorized                                   |
+  |<---------------------------------------------|
+```
+
+**Key properties:**
+- The server learns the RC's public key only when recovery is triggered, never at rest.
+- The RC discovers which `_rc` record is theirs by attempting decryption — they cannot determine who else is designated as RC.
+- An observer cannot determine the RC's identity from the DNS record.
+
+### 7.5 Encrypted RC Name
+
+The `name` field is a sealed box encrypted to the user's root public key:
+
+```
+name = SealedBox(user_root_x25519_pk, "Tara")
+```
+
+This lets the user decrypt and see a friendly name for each RC. Essential when multiple RCs are designated (future M-of-N), as the RCIDs themselves are indistinguishable.
+
+### 7.6 Examples
+
+**Single recovery contact:**
 ```
 01j5a3k7pm9qwr4txyz6bn8vhe._rc.id.example.org.  3600  IN  TXT
-  "v=1;rc=01j5tara0000000000000000rc;sig=cmVjb3Zlcnkgc2ln;window=14d;death_window=60d"
+  "v=1;rcid=Hx8k2Qm9Tp4vN7jLwBs3YhD6gCeAv1RK_XJ0NfMqUcWd5lzSoI1EiPt_Gyu3bF8nKw2xR7pT;name=a8Fk2mNx9pQ3rLvJw;window=14d;death_window=60d"
 ```
 
-**Custom windows:**
+**Multiple recovery contacts (future M-of-N):**
 ```
 01j5a3k7pm9qwr4txyz6bn8vhe._rc.id.example.org.  3600  IN  TXT
-  "v=1;rc=01j5tara0000000000000000rc;sig=cmVjb3Zlcnkgc2ln;window=7d;death_window=30d"
+  "v=1;rcid=Hx8k2Qm9Tp4vN7jLwBs3YhD6gCeAv1RK;name=a8Fk2mNx9pQ3rLvJw;window=14d;death_window=60d"
+
+01j5a3k7pm9qwr4txyz6bn8vhe._rc.id.example.org.  3600  IN  TXT
+  "v=1;rcid=Px3mWnK4pLs8Bf2TgVjRcY0hAv3DwZeU;name=b7Gj9kRw2xFn7sT8;window=14d;death_window=60d"
+
+01j5a3k7pm9qwr4txyz6bn8vhe._rc.id.example.org.  3600  IN  TXT
+  "v=1;rcid=Qx9nZoL5qMt9Cg3UhWkScZ1iBw4ExAf;name=c6Hk0lSx3yGo8uU9;window=7d;death_window=30d"
 ```
 
-See [RECOVERY-SPEC.md](RECOVERY-SPEC.md) for full recovery contact lifecycle, change procedures, and recovery scenarios.
+An observer sees: 3 opaque blobs. Cannot determine who any of them are. Even the RCs themselves can only identify their own record (by attempting decryption), not each other's.
 
 ---
 
@@ -464,7 +561,7 @@ See [RECOVERY-SPEC.md](RECOVERY-SPEC.md) for full recovery contact lifecycle, ch
 ### 8.1 Record Format
 
 ```
-<uid>._rcc.<domain>  TXT  "v=1;old_rc=<old-uid>;new_rc=<new-uid>;ts=<timestamp>;effective=<timestamp+7d>;sig=<base64url>"
+<uid>._rcc.<domain>  TXT  "v=1;old_rcid=<base64url>;new_rcid=<base64url>;new_name=<base64url>;ts=<timestamp>;effective=<timestamp+7d>;sig=<base64url>"
 ```
 
 ### 8.2 Field Table
@@ -472,8 +569,9 @@ See [RECOVERY-SPEC.md](RECOVERY-SPEC.md) for full recovery contact lifecycle, ch
 | Field       | Required | Type      | Description |
 |-------------|----------|-----------|-------------|
 | `v`         | Yes      | Integer   | Spec version. Currently `1`. |
-| `old_rc`    | Yes      | ULID      | UID of the current recovery contact being replaced. |
-| `new_rc`    | Yes      | ULID      | UID of the new recovery contact. |
+| `old_rcid`  | Yes      | Base64url | The `rcid` value from the `_rc` record being replaced. Used to identify which RC is changing. |
+| `new_rcid`  | Yes      | Base64url | New sealed box RCID for the replacement recovery contact (same construction as §7.3). |
+| `new_name`  | No       | Base64url | Sealed box with friendly name for the new RC, encrypted to user's root key. |
 | `ts`        | Yes      | ISO 8601  | Timestamp when the change was initiated. |
 | `effective` | Yes      | ISO 8601  | Timestamp when the change takes effect (MUST be >= `ts` + 7 days). |
 | `sig`       | Yes      | Base64url | Root key signature authorizing this change. |
@@ -481,23 +579,23 @@ See [RECOVERY-SPEC.md](RECOVERY-SPEC.md) for full recovery contact lifecycle, ch
 ### 8.3 Signature Construction
 
 ```
-message = "rc_change" | uid | old_rc_uid | new_rc_uid | timestamp
+message = "rc_change" | uid | old_rcid | new_rcid | timestamp
 ```
 
-Signed with the root key using the same byte-concatenation approach as other signatures.
+Signed with the root key using byte-concatenation. The `old_rcid` and `new_rcid` are included as their raw Base64url string bytes.
 
 ### 8.4 Lifecycle: Pending, Effective, Removed
 
 **Pending (days 0-7):**
 - `_rcc` record is published.
-- Both old and new recovery contacts are notified by the identity server.
-- Old recovery contact can raise an alarm (flag as suspicious).
+- The user notifies both old and new recovery contacts out-of-band (the server does not know their identities).
+- The old RC can detect the pending change by checking for `_rcc` records and recognizing their `old_rcid`.
 - Any device key OR root key can cancel the change (identity server removes the `_rcc` record).
 - Old recovery contact retains full recovery powers.
 
 **Effective (after 7 days):**
 - `_rcc` record is removed.
-- `_rc` record is updated: `rc` field changes to `new_rc`.
+- The `_rc` record matching `old_rcid` is replaced with a new `_rc` record containing `new_rcid` and `new_name`.
 - New recovery contact has full recovery powers.
 
 **Blocked:**
@@ -508,7 +606,7 @@ Signed with the root key using the same byte-concatenation approach as other sig
 **Pending change:**
 ```
 01j5a3k7pm9qwr4txyz6bn8vhe._rcc.id.example.org.  300  IN  TXT
-  "v=1;old_rc=01j5tara0000000000000000rc;new_rc=01j5mike0000000000000000rc;ts=2026-03-01T00:00:00Z;effective=2026-03-08T00:00:00Z;sig=cmNfY2hhbmdlIHNpZw"
+  "v=1;old_rcid=Hx8k2Qm9Tp4vN7jLwBs3YhD6gCeAv1RK;new_rcid=Zw4pXnM8tRu2Yc6VqKjFbE7iDsGhL0;new_name=d5Il1mTy4zHp9vV0;ts=2026-03-01T00:00:00Z;effective=2026-03-08T00:00:00Z;sig=cmNfY2hhbmdlIHNpZw"
 ```
 
 Note the shorter TTL (300s) during the pending period to ensure timely propagation of any cancellation.
@@ -520,7 +618,7 @@ Note the shorter TTL (300s) during the pending period to ensure timely propagati
 ### 9.1 Record Format
 
 ```
-<uid>._s.<domain>  TXT  "v=1;state=<state>;by=<initiator-uid>;ts=<timestamp>;expires=<timestamp>;sig=<base64url>"
+<uid>._s.<domain>  TXT  "v=1;state=<state>;ts=<timestamp>;expires=<timestamp>;sig=<base64url>"
 ```
 
 ### 9.2 Field Table
@@ -529,10 +627,11 @@ Note the shorter TTL (300s) during the pending period to ensure timely propagati
 |-----------|----------|-----------|-------------|
 | `v`       | Yes      | Integer   | Spec version. Currently `1`. |
 | `state`   | Yes      | String    | Account state. One of: `root_rotation`, `full_recovery`, `death`, `tombstone`. |
-| `by`      | Conditional | ULID   | UID of the entity that initiated the state change. Not present for `tombstone`. |
 | `ts`      | Yes      | ISO 8601  | Timestamp when this state was entered. |
 | `expires` | Conditional | ISO 8601 | When the grace period ends. Not present for `tombstone`. |
 | `sig`     | Conditional | Base64url | Signature authorizing the state change. Not present for `tombstone`. |
+
+Note: The `by` field from earlier versions has been removed. The initiator's identity is protected by the blind RCID scheme — it is verified cryptographically at initiation time but not published in DNS.
 
 ### 9.3 State Values and Meanings
 
@@ -552,26 +651,26 @@ Tombstone is the permanent, terminal state. The record is simplified:
 <uid>._s.<domain>  TXT  "v=1;state=tombstone;ts=<timestamp>"
 ```
 
-No `by`, `expires`, or `sig` fields. The tombstone record SHOULD be retained indefinitely to prevent UID reuse.
+No `expires` or `sig` fields. The tombstone record SHOULD be retained indefinitely to prevent UID reuse.
 
 ### 9.5 Examples
 
 **Root rotation in progress:**
 ```
 01j5a3k7pm9qwr4txyz6bn8vhe._s.id.example.org.  300  IN  TXT
-  "v=1;state=root_rotation;by=01j5a3k7pm9qwr4txyz6bn8vhe;ts=2026-03-01T00:00:00Z;expires=2026-03-15T00:00:00Z;sig=cm90YXRpb24gc2ln"
+  "v=1;state=root_rotation;ts=2026-03-01T00:00:00Z;expires=2026-03-15T00:00:00Z;sig=cm90YXRpb24gc2ln"
 ```
 
 **Full recovery in progress:**
 ```
 01j5a3k7pm9qwr4txyz6bn8vhe._s.id.example.org.  300  IN  TXT
-  "v=1;state=full_recovery;by=01j5tara0000000000000000rc;ts=2026-03-01T00:00:00Z;expires=2026-03-15T00:00:00Z;sig=cmVjb3Zlcnkgc2ln"
+  "v=1;state=full_recovery;ts=2026-03-01T00:00:00Z;expires=2026-03-15T00:00:00Z;sig=cmVjb3Zlcnkgc2ln"
 ```
 
 **Death declaration:**
 ```
 01j5a3k7pm9qwr4txyz6bn8vhe._s.id.example.org.  300  IN  TXT
-  "v=1;state=death;by=01j5tara0000000000000000rc;ts=2026-03-01T00:00:00Z;expires=2026-04-30T00:00:00Z;sig=ZGVhdGggc2ln"
+  "v=1;state=death;ts=2026-03-01T00:00:00Z;expires=2026-04-30T00:00:00Z;sig=ZGVhdGggc2ln"
 ```
 
 **Tombstone (permanent):**
@@ -645,7 +744,7 @@ All paths are relative to the `issuer` URL from the `_idp` record.
 | `/k/<uid>`                 | `<uid>._k`    | JSON array of entity public keys |
 | `/h/<normalized-handle>`  | `<handle>._h` | JSON: UID for handle |
 | `/m/<uid>`                 | `<uid>._m`    | JSON: migration record |
-| `/rc/<uid>`                | `<uid>._rc`   | JSON: recovery contact record |
+| `/rc/<uid>`                | `<uid>._rc`   | JSON: recovery contact records (opaque RCIDs) |
 | `/s/<uid>`                 | `<uid>._s`    | JSON: account state record |
 
 ### 11.2 JSON Response Formats
@@ -664,10 +763,10 @@ All paths are relative to the `issuer` URL from the `_idp` record.
     },
     {
       "k": "ed25519",
-      "kid": "desktop-2026",
+      "kid": "a7f3b2c1",
       "pk": "ZGVza3RvcCBrZXk",
       "flag": "primary",
-      "device": "ryan-desktop",
+      "device": "k8Tn2pFxQm4rV7jLwBs9YhD3gCeAv6RKXJ0NfMqUcWdHb5lzSoI1EiPtGyu",
       "enroll_sig": "ZW5yb2xsLWRlc2t0b3A"
     }
   ]
@@ -692,14 +791,18 @@ All paths are relative to the `issuer` URL from the `_idp` record.
 }
 ```
 
-**`/rc/<uid>` — Recovery contact:**
+**`/rc/<uid>` — Recovery contact records:**
 ```json
 {
   "v": 1,
-  "rc": "01j5tara0000000000000000rc",
-  "sig": "cmVjb3Zlcnkgc2ln",
-  "window": "14d",
-  "death_window": "60d"
+  "contacts": [
+    {
+      "rcid": "Hx8k2Qm9Tp4vN7jLwBs3YhD6gCeAv1RK_XJ0NfMqUcWd5lzSoI1EiPt_Gyu3bF8nKw2xR7pT",
+      "name": "a8Fk2mNx9pQ3rLvJw",
+      "window": "14d",
+      "death_window": "60d"
+    }
+  ]
 }
 ```
 
@@ -708,7 +811,6 @@ All paths are relative to the `issuer` URL from the `_idp` record.
 {
   "v": 1,
   "state": "root_rotation",
-  "by": "01j5a3k7pm9qwr4txyz6bn8vhe",
   "ts": "2026-03-01T00:00:00Z",
   "expires": "2026-03-15T00:00:00Z",
   "sig": "cm90YXRpb24gc2ln"
@@ -750,7 +852,7 @@ See [IDENTITY-SPEC.md §8](IDENTITY-SPEC.md) for the full resolution strategy.
 
 These security considerations are specific to DNS record handling. See [IDENTITY-SPEC.md](IDENTITY-SPEC.md) for operational security and [RECOVERY-SPEC.md](RECOVERY-SPEC.md) for recovery-related threats.
 
-**DNS is not private.** Public keys are public by design. Do not store sensitive data in DNS records. Handle mappings reveal community membership — keep them opt-in.
+**DNS is not private — but metadata can be.** Public keys are public by design. However, the sealed box encryption pattern (§1.5) protects sensitive metadata: device names are opaque, recovery contact relationships are hidden, and RC friendly names are encrypted. The only public information is the UID, public keys, and record structure.
 
 **DNSSEC recommended but not required.** Without DNSSEC, network attackers could spoof DNS responses and serve fraudulent keys. Mitigations: HTTPS fallback (TLS provides authenticity), dual-source verification (two zones must agree), TOFU pinning (detects key changes after first use).
 
@@ -763,9 +865,15 @@ These security considerations are specific to DNS record handling. See [IDENTITY
 
 Enrollment signature verification and dual-source checking limit the impact of DNS-only attacks.
 
-**TXT record size.** Records exceeding 255 bytes require multi-string TXT encoding. Implementations that don't handle string concatenation will fail to parse device key records with enrollment signatures. Test multi-string parsing explicitly.
+**Sealed box privacy model.** The blind RCID scheme provides strong privacy for recovery contact relationships:
+- At rest: the RC's identity is hidden behind asymmetric encryption (sealed box). No UID, no public key, no identifiable information.
+- At recovery time: the RC reveals themselves by presenting their public key and the decrypted authorization. The server learns the RC's identity only when recovery is triggered.
+- Bidirectional opacity: even a recovery contact cannot determine who else is designated as RC for the same user. They can only identify their own record by attempting decryption.
+- Enumeration resistance: an attacker would need to try decrypting every `_rc` record with every known private key — a computationally expensive operation with no shortcut.
 
-**Zone transfer exposure.** If the identity domain allows zone transfers (AXFR), all UIDs, handles, and key material are bulk-enumerable. Identity domain operators SHOULD restrict zone transfers to authorized secondaries only.
+**TXT record size.** Records exceeding 255 bytes require multi-string TXT encoding. Sealed box fields (device names, RCIDs) increase record sizes. Implementations MUST handle string concatenation and SHOULD test multi-string parsing explicitly.
+
+**Zone transfer exposure.** If the identity domain allows zone transfers (AXFR), UIDs and public keys are bulk-enumerable, but device names and RC relationships remain protected by encryption. Identity domain operators SHOULD still restrict zone transfers to authorized secondaries.
 
 ---
 
@@ -786,8 +894,8 @@ _idp                      TXT  "v=1;issuer=https://id.example.org"
 ; User: root key
 01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=root-2026;pk=cm9vdCBrZXkgZ29lcyBoZXJl;flag=root"
 
-; User: device key (desktop)
-01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=desktop-2026;pk=ZGVza3RvcCBrZXk;flag=primary;device=ryan-desktop;enroll_sig=ZW5yb2xsLWRlc2t0b3A"
+; User: device key (encrypted name, opaque kid)
+01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=a7f3b2c1;pk=ZGVza3RvcCBrZXk;flag=primary;device=k8Tn2pFxQm4rV7jLwBs9YhD3gCeAv6RKXJ0NfMqUcWdHb5lzSoI1EiPtGyu;enroll_sig=ZW5yb2xsLWRlc2t0b3A"
 ```
 
 ### 13.2 Typical Community (IDP + Users + Server)
@@ -805,19 +913,19 @@ _idp                      TXT  "v=1;issuer=https://id.example.org"
 ; === User: Ryan ===
 ; Root key
 01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=root-2026;pk=cnlhbiByb290IGtleQ;flag=root"
-; Device keys
-01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=desktop-2026;pk=cnlhbiBkZXNrdG9wIGtleQ;flag=primary;device=ryan-desktop;enroll_sig=ZW5yb2xsLXJ5YW4tZGVza3RvcA"
-01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=phone-2026;pk=cnlhbiBwaG9uZSBrZXk;device=ryan-phone;enroll_sig=ZW5yb2xsLXJ5YW4tcGhvbmU"
+; Device keys (encrypted names, opaque kids)
+01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=a7f3b2c1;pk=cnlhbiBkZXNrdG9wIGtleQ;flag=primary;device=k8Tn2pFxQm4rV7jL;enroll_sig=ZW5yb2xsLXJ5YW4tZGVza3RvcA"
+01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=e9d4f8a0;pk=cnlhbiBwaG9uZSBrZXk;device=Qx7mWnK4pLs8Bf2T;enroll_sig=ZW5yb2xsLXJ5YW4tcGhvbmU"
 ; Handle
 ryan._h                   TXT  "v=1;uid=01j5a3k7pm9qwr4txyz6bn8vhe"
-; Recovery contact (Tara)
-01j5a3k7pm9qwr4txyz6bn8vhe._rc  TXT  "v=1;rc=01j5tara0000000000000000rc;sig=cmVjb3Zlcnkgc2ln;window=14d;death_window=60d"
+; Recovery contact (blind RCID — observer cannot tell who this is)
+01j5a3k7pm9qwr4txyz6bn8vhe._rc  TXT  "v=1;rcid=Hx8k2Qm9Tp4vN7jLwBs3YhD6gCeAv1RK;name=a8Fk2mNx9pQ3rLvJw;window=14d;death_window=60d"
 
 ; === User: Tara ===
 ; Root key
 01j5tara0000000000000000rc._k  TXT  "v=1;k=ed25519;kid=root-2026;pk=dGFyYSByb290IGtleQ;flag=root"
 ; Device key
-01j5tara0000000000000000rc._k  TXT  "v=1;k=ed25519;kid=laptop-2026;pk=dGFyYSBsYXB0b3Aga2V5;flag=primary;device=tara-laptop;enroll_sig=ZW5yb2xsLXRhcmEtbGFwdG9w"
+01j5tara0000000000000000rc._k  TXT  "v=1;k=ed25519;kid=f1b2c3d4;pk=dGFyYSBsYXB0b3Aga2V5;flag=primary;device=Wm5nPqLx2Ws5Tv7j;enroll_sig=ZW5yb2xsLXRhcmEtbGFwdG9w"
 ; Handle
 tara._h                   TXT  "v=1;uid=01j5tara0000000000000000rc"
 
@@ -838,7 +946,7 @@ _k  TXT  "v=1;k=ed25519;kid=srv-2026;pk=c2VydmVyIGtleSBnb2VzIGhlcmU;uid=01j5srv7
 ### 13.3 During Active Recovery
 
 ```bind
-; Ryan's account during full recovery (initiated by Tara)
+; Ryan's account during full recovery
 ; Note: TTLs dropped to 300 for fast propagation
 
 $ORIGIN id.example.org.
@@ -848,14 +956,14 @@ $TTL 300
 01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=root-2026;pk=cnlhbiByb290IGtleQ;flag=root"
 
 ; Device keys (contested during full recovery)
-01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=desktop-2026;pk=cnlhbiBkZXNrdG9wIGtleQ;flag=primary,contested;device=ryan-desktop;enroll_sig=ZW5yb2xsLXJ5YW4tZGVza3RvcA"
-01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=phone-2026;pk=cnlhbiBwaG9uZSBrZXk;flag=contested;device=ryan-phone;enroll_sig=ZW5yb2xsLXJ5YW4tcGhvbmU"
+01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=a7f3b2c1;pk=cnlhbiBkZXNrdG9wIGtleQ;flag=primary,contested;device=k8Tn2pFxQm4rV7jL;enroll_sig=ZW5yb2xsLXJ5YW4tZGVza3RvcA"
+01j5a3k7pm9qwr4txyz6bn8vhe._k  TXT  "v=1;k=ed25519;kid=e9d4f8a0;pk=cnlhbiBwaG9uZSBrZXk;flag=contested;device=Qx7mWnK4pLs8Bf2T;enroll_sig=ZW5yb2xsLXJ5YW4tcGhvbmU"
 
-; Account state: full recovery in progress
-01j5a3k7pm9qwr4txyz6bn8vhe._s  TXT  "v=1;state=full_recovery;by=01j5tara0000000000000000rc;ts=2026-03-01T00:00:00Z;expires=2026-03-15T00:00:00Z;sig=cmVjb3Zlcnkgc2ln"
+; Account state: full recovery in progress (no 'by' field — initiator protected by blind RCID)
+01j5a3k7pm9qwr4txyz6bn8vhe._s  TXT  "v=1;state=full_recovery;ts=2026-03-01T00:00:00Z;expires=2026-03-15T00:00:00Z;sig=cmVjb3Zlcnkgc2ln"
 
-; Recovery contact (unchanged)
-01j5a3k7pm9qwr4txyz6bn8vhe._rc  TXT  "v=1;rc=01j5tara0000000000000000rc;sig=cmVjb3Zlcnkgc2ln;window=14d;death_window=60d"
+; Recovery contact (unchanged, still opaque)
+01j5a3k7pm9qwr4txyz6bn8vhe._rc  TXT  "v=1;rcid=Hx8k2Qm9Tp4vN7jLwBs3YhD6gCeAv1RK;name=a8Fk2mNx9pQ3rLvJw;window=14d;death_window=60d"
 ```
 
 ---
@@ -865,13 +973,13 @@ $TTL 300
 | Record Type | DNS Label | Purpose | Key Fields |
 |-------------|-----------|---------|------------|
 | Identity Provider | `_idp.<domain>` | Discover SSO issuer and JWKS | `issuer`, `jwks` |
-| Entity Key | `<uid>._k.<domain>` | Publish root and device keys | `k`, `kid`, `pk`, `flag`, `device`, `enroll_sig` |
+| Entity Key | `<uid>._k.<domain>` | Publish root and device keys | `k`, `kid`, `pk`, `flag`, `device` (sealed box), `enroll_sig` |
 | Server Self-Key | `_k.<server-domain>` | Dual-source trust anchor | `k`, `kid`, `pk`, `uid` |
 | Handle | `<handle>._h.<domain>` | Map human name to UID | `uid` |
 | Migration | `<uid>._m.<domain>` | Redirect to new identity domain | `to`, `ts`, `sig` |
-| Recovery Contact | `<uid>._rc.<domain>` | Designate social recovery contact | `rc`, `sig`, `window`, `death_window` |
-| RC Change | `<uid>._rcc.<domain>` | Pending recovery contact change | `old_rc`, `new_rc`, `ts`, `effective`, `sig` |
-| Account State | `<uid>._s.<domain>` | Signal non-stable account state | `state`, `by`, `ts`, `expires`, `sig` |
+| Recovery Contact | `<uid>._rc.<domain>` | Designate social recovery contact | `rcid` (sealed box), `name` (sealed box), `window`, `death_window` |
+| RC Change | `<uid>._rcc.<domain>` | Pending recovery contact change | `old_rcid`, `new_rcid`, `new_name`, `ts`, `effective`, `sig` |
+| Account State | `<uid>._s.<domain>` | Signal non-stable account state | `state`, `ts`, `expires`, `sig` |
 
 ---
 
@@ -881,6 +989,8 @@ $TTL 300
 |-----------|----------|-----------|---------|
 | Public key (`pk`) | Base64url, no padding | 32 bytes raw / 43 chars encoded | `cm9vdCBrZXkgZ29lcyBoZXJl` |
 | Signature (`sig`, `enroll_sig`) | Base64url, no padding | 64 bytes raw / 86 chars encoded | `c2lnbmF0dXJlIGdvZXMgaGVyZQ` |
+| Sealed box (short plaintext) | Base64url, no padding | plaintext + 48 bytes overhead | `k8Tn2pFxQm4rV7jLwBs9YhD3g` |
+| Sealed box (64-byte signature) | Base64url, no padding | 112 bytes raw / 150 chars encoded | `Hx8k2Qm9Tp4vN7jLwBs3YhD6g...` |
 | UID | Crockford Base32 | 16 bytes raw / 26 chars encoded | `01j5a3k7pm9qwr4txyz6bn8vhe` |
 | Timestamp | ISO 8601 UTC | Variable | `2026-03-01T00:00:00Z` |
 | Duration | Integer + unit | Variable | `14d`, `60d`, `7d` |
