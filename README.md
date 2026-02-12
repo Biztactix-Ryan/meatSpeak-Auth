@@ -10,7 +10,7 @@ MeatSpeak uses a decentralized identity layer that replaces traditional server a
 
 ### Identity Library (`MeatSpeak.Identity`)
 
-A complete implementation of the [Identity Spec v0.2](specs/IDENTITY-SPEC.md).
+A complete implementation of the [Identity Spec v0.4](specs/IDENTITY-SPEC.md).
 
 #### Cryptography (`Crypto/`)
 
@@ -90,7 +90,9 @@ src/
 tests/
   MeatSpeak.Identity.Tests/  # xUnit + NSubstitute
 specs/
-  IDENTITY-SPEC.md           # Identity layer spec (v0.2)
+  IDENTITY-SPEC.md           # Core identity spec (v0.4)
+  DNS-RECORDS-SPEC.md        # DNS record reference (v0.4)
+  RECOVERY-SPEC.md           # Recovery & account lifecycle (v0.4)
   VOICE-SPEC.md              # Voice extension spec (v0.1)
 ```
 
@@ -122,10 +124,181 @@ dotnet test MeatSpeak.Identity.sln
 
 ## Specs
 
-| Spec | Version | Description |
-|------|---------|-------------|
-| [Identity](specs/IDENTITY-SPEC.md) | v0.2 | DNS-based decentralized identity — Ed25519 signatures, dual-source verification, TOFU pinning, mutual auth, SSO with short-lived JWTs, three-layer key recovery (device / SSO encrypted backup / cold backup) |
-| [Voice](specs/VOICE-SPEC.md) | v0.1 | SFU voice over IRC — Opus codec, XChaCha20-Poly1305 transport encryption, optional E2E encryption with group key rotation, spatial audio, whisper/priority speakers, stage channels |
+### Identity Specifications (v0.4)
+
+The identity system is documented across three focused specs:
+
+#### [Core Identity Specification](specs/IDENTITY-SPEC.md)
+
+Start here. Defines how identity works day-to-day: entities, UIDs, key hierarchy, dual-source DNS verification, mutual authentication, SSO integration, and registration flows.
+
+#### [DNS Record Reference](specs/DNS-RECORDS-SPEC.md)
+
+Keep this open while coding. Normative reference for all DNS record types: field tables, encoding rules, TXT record conventions, TTL strategy, HTTPS fallback endpoints with JSON formats, and complete zone file examples.
+
+#### [Recovery & Account Lifecycle](specs/RECOVERY-SPEC.md)
+
+What happens when things go wrong. Four-layer key recovery model, recovery contacts, account state model, and detailed scenarios for root key rotation, full recovery, and social death — each with step-by-step flows, edge cases, and security analysis.
+
+#### [Voice Extension](specs/VOICE-SPEC.md) (v0.1)
+
+SFU voice over IRC — Opus codec, XChaCha20-Poly1305 transport encryption, optional E2E encryption with group key rotation, spatial audio, whisper/priority speakers, stage channels.
+
+### Workflow Diagrams
+
+#### Device Enrollment
+
+Detailed steps: see [IDENTITY-SPEC.md §2.3](specs/IDENTITY-SPEC.md) and [DNS-RECORDS-SPEC.md §3.7](specs/DNS-RECORDS-SPEC.md)
+
+```
+User (has root key)              Identity Server
+  |                                    |
+  | Generate device keypair            |
+  | Sign enrollment with root key      |
+  |                                    |
+  | Send: uid, device_pk, enroll_sig   |
+  |----------------------------------->|
+  |                                    |
+  |    Verify enroll_sig against       |
+  |    root key in DNS                 |
+  |                                    |
+  |    Publish device key TXT record   |
+  |                                    |
+  | OK                                 |
+  |<-----------------------------------|
+```
+
+#### Device Revocation (lost/stolen device)
+
+Detailed steps: see [IDENTITY-SPEC.md §2.4](specs/IDENTITY-SPEC.md)
+
+```
+User (has root key)              Identity Server
+  |                                    |
+  | Sign revocation for device_kid     |
+  | with root key                      |
+  |                                    |
+  | Send: uid, device_kid, revoke_sig  |
+  |----------------------------------->|
+  |                                    |
+  |    Verify revoke_sig against       |
+  |    root key in DNS                 |
+  |                                    |
+  |    Set flag=revoked on device key  |
+  |                                    |
+  | OK                                 |
+  |<-----------------------------------|
+```
+
+#### Root Key Rotation (lost root key, has working devices)
+
+Detailed steps: see [RECOVERY-SPEC.md §5](specs/RECOVERY-SPEC.md)
+
+```
+Ryan (device key)        Tara (recovery contact)     Identity Server
+  |                           |                            |
+  | "I need root rotation"    |                            |
+  | signed with device key    |                            |
+  |-------------------------------------------------------->|
+  |                           |                            |
+  |                           | Confirm rotation           |
+  |                           | signed with her key        |
+  |                           |--------------------------->|
+  |                           |                            |
+  |                     State: ROOT_ROTATION               |
+  |                     14-day waiting period               |
+  |                     (cancelable by any device key)      |
+  |                           |                            |
+  |  ... 14 days pass ...     |                            |
+  |                           |                            |
+  | Generate new root key     |                            |
+  | Tara signs authorization  |                            |
+  |-------------------------------------------------------->|
+  |                           |                            |
+  |                     Old root revoked                   |
+  |                     New root published                 |
+  |                     Device keys unchanged              |
+```
+
+#### Full Recovery (lost everything)
+
+Detailed steps: see [RECOVERY-SPEC.md §6](specs/RECOVERY-SPEC.md)
+
+```
+Ryan (no keys)           Tara (recovery contact)     Identity Server
+  |                           |                            |
+  | (out-of-band: "help!")    |                            |
+  |  ~~~~phone call~~~~>      |                            |
+  |                           |                            |
+  |                           | Initiate full recovery     |
+  |                           | signed with her key        |
+  |                           |--------------------------->|
+  |                           |                            |
+  |                     State: FULL_RECOVERY               |
+  |                     All device keys: contested         |
+  |                     14-day waiting period               |
+  |                     (cancelable by root key ONLY)       |
+  |                           |                            |
+  |  ... 14 days pass ...     |                            |
+  |                           |                            |
+  | Generate new root key     |                            |
+  | + first device key        |                            |
+  | Tara signs authorization  |                            |
+  |-------------------------------------------------------->|
+  |                           |                            |
+  |                     All old keys revoked               |
+  |                     New root + device published        |
+```
+
+#### Recovery Contact Change
+
+Detailed steps: see [RECOVERY-SPEC.md §3.3-3.4](specs/RECOVERY-SPEC.md)
+
+```
+User (root key)          Old Contact       New Contact     Identity Server
+  |                          |                 |                 |
+  | Sign rc_change           |                 |                 |
+  | with root key            |                 |                 |
+  |----------------------------------------------------->------->|
+  |                          |                 |                 |
+  |                     State: RC_CHANGE_PENDING                 |
+  |                     7-day waiting period                      |
+  |                          |                 |                 |
+  |                 Notified |        Notified |                 |
+  |                     <----|           <-----|                 |
+  |                          |                 |                 |
+  |  (cancelable by any device key or root key)                  |
+  |                          |                 |                 |
+  |  ... 7 days pass ...     |                 |                 |
+  |                          |                 |                 |
+  |                     Old contact removed                      |
+  |                     New contact active                       |
+```
+
+#### Social Death
+
+Detailed steps: see [RECOVERY-SPEC.md §7](specs/RECOVERY-SPEC.md)
+
+```
+                         Tara (recovery contact)     Identity Server
+                              |                            |
+                              | Initiate death declaration |
+                              | signed with her key        |
+                              |--------------------------->|
+                              |                            |
+                        State: DEATH                       |
+                        60-day grace period                 |
+                        Sessions continue                  |
+                        (cancelable by root key             |
+                         or ANY device key)                 |
+                              |                            |
+  ... 60 days, no cancellation ...                         |
+                              |                            |
+                        State: TOMBSTONE                   |
+                        All keys revoked                   |
+                        UID permanently burned             |
+                        Can never be re-enabled            |
+```
 
 ## Related Repositories
 
