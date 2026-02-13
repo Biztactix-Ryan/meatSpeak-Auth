@@ -10,7 +10,7 @@ MeatSpeak uses a decentralized identity layer that replaces traditional server a
 
 ### Identity Library (`MeatSpeak.Identity`)
 
-A complete implementation of the [Identity Spec v0.4](specs/IDENTITY-SPEC.md).
+A complete implementation of the [Identity Spec v0.5](specs/IDENTITY-SPEC.md).
 
 #### Cryptography (`Crypto/`)
 
@@ -90,9 +90,9 @@ src/
 tests/
   MeatSpeak.Identity.Tests/  # xUnit + NSubstitute
 specs/
-  IDENTITY-SPEC.md           # Core identity spec (v0.4)
-  DNS-RECORDS-SPEC.md        # DNS record reference (v0.4)
-  RECOVERY-SPEC.md           # Recovery & account lifecycle (v0.4)
+  IDENTITY-SPEC.md           # Core identity spec (v0.5)
+  DNS-RECORDS-SPEC.md        # DNS record reference (v0.5)
+  RECOVERY-SPEC.md           # Recovery & account lifecycle (v0.5)
   VOICE-SPEC.md              # Voice extension spec (v0.1)
 ```
 
@@ -124,7 +124,7 @@ dotnet test MeatSpeak.Identity.sln
 
 ## Specs
 
-### Identity Specifications (v0.4)
+### Identity Specifications (v0.5)
 
 The identity system is documented across three focused specs:
 

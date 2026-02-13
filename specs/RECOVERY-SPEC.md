@@ -1,4 +1,4 @@
-# Recovery & Account Lifecycle — v0.4
+# Recovery & Account Lifecycle — v0.5
 
 **Status:** Draft
 **Parent document:** [IDENTITY-SPEC.md](IDENTITY-SPEC.md)
@@ -183,9 +183,10 @@ A user designates another user as their recovery contact by creating a **blind R
 
 **RCID construction:**
 1. User knows the RC's Ed25519 public key.
-2. Root key signs authorization: `auth_sig = Sign(root_key, "recover" || uid || rc_pk || window || death_window || timestamp)`
-3. Seal to the RC's X25519 public key: `rcid = SealedBox(rc_x25519_pk, auth_sig)`
-4. Optionally encrypt a friendly name: `name = SealedBox(user_root_x25519_pk, "Tara")`
+2. Construct authorization message with null-byte separators: `msg = "recover" 0x00 uid 0x00 rc_pk 0x00 window 0x00 death_window 0x00 timestamp`
+3. Root key signs authorization: `auth_sig = Sign(root_key, msg)` (64 bytes)
+4. Seal to the RC's X25519 public key: `rcid = SealedBox(rc_x25519_pk, auth_sig)` (112 bytes)
+5. Optionally encrypt a friendly name (max 64 bytes UTF-8): `name = SealedBox(user_root_x25519_pk, "Tara")`
 
 - `rcid` = sealed box containing the root key's authorization signature, encrypted to the RC's public key. Only the RC can decrypt.
 - `name` = sealed box containing a friendly name for the RC, encrypted to the user's root public key. Only the user can decrypt.

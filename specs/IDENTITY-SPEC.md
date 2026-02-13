@@ -1,4 +1,4 @@
-# DNS-First Identity Layer — Core Specification v0.4
+# DNS-First Identity Layer — Core Specification v0.5
 
 **Status:** Draft
 **Goal:** A decentralized, low-cost identity system for open-source communities using DNS as the public directory and Ed25519 signatures for verification. No always-on central infrastructure required.
@@ -6,6 +6,8 @@
 **Companion Documents:**
 - [DNS-RECORDS-SPEC.md](DNS-RECORDS-SPEC.md) — Normative reference for all DNS record types, field tables, encoding rules, zone file examples
 - [RECOVERY-SPEC.md](RECOVERY-SPEC.md) — Recovery contacts, account state model, recovery scenarios, key storage layers
+
+**Changes from v0.4:** Added strict field size constraints to prevent DoS via oversized payloads. Nonces fixed to exactly 16 bytes. Timestamps fixed to exactly 20 chars. All signature constructions now use null-byte (`0x00`) separators to prevent field boundary ambiguity. Device key IDs strictly 8 hex chars. Handshake messages capped at 512 bytes.
 
 **Changes from v0.3:** Split monolithic spec into three focused documents. Core spec retains day-to-day identity operations. Recovery scenarios expanded with edge cases and UX guidance (see RECOVERY-SPEC). DNS record formats expanded with full field tables, zone file examples, and HTTPS JSON formats (see DNS-RECORDS-SPEC). Added sealed box encryption for metadata privacy: encrypted device names, opaque device key IDs, blind RCIDs for recovery contact privacy, encrypted RC friendly names.
 
@@ -73,21 +75,21 @@ All entities use the same UID format, key format, DNS layout, and verification f
 
 - Per-device Ed25519 keypairs, published in DNS with `device=<sealed-box>` and `enroll_sig=<sig>`
 - The `device` field is an **encrypted device name** — a sealed box encrypted to the user's root public key (Ed25519→X25519). Only the root key holder can decrypt to see the human-readable name (e.g., "ryan-desktop"). Observers see an opaque blob.
-- Device key IDs (`kid`) MUST be opaque (e.g., first 8 hex chars of `BLAKE2b(pk)`) — descriptive names like `desktop-2026` leak device information.
+- Device key IDs (`kid`) MUST be exactly 8 lowercase hex characters derived from `BLAKE2b(pk)` — descriptive names like `desktop-2026` leak device information.
 - Used for all authentication (mutual auth, SSO challenge-response, etc.)
 - Each device key is independently revocable without affecting other devices
 - Clients performing authentication use device keys, never root key
 
 ### 2.3 Device Enrollment
 
-- Requires root key signature: `Sign(root_key, "enroll"|uid|device_kid|device_pk|timestamp)`
+- Requires root key signature: `Sign(root_key, "enroll" 0x00 uid 0x00 device_kid 0x00 device_pk 0x00 timestamp)`
 - Published as a new TXT record with the enrollment signature embedded
 - Identity server verifies enrollment signature against the published root key before accepting
 - See [DNS-RECORDS-SPEC.md §3.7](DNS-RECORDS-SPEC.md#37-enrollment-signature-verification) for verification pseudocode
 
 ### 2.4 Device Revocation
 
-- Requires root key signature: `Sign(root_key, "revoke"|uid|device_kid|timestamp)`
+- Requires root key signature: `Sign(root_key, "revoke" 0x00 uid 0x00 device_kid 0x00 timestamp)`
 - Revoked device key gets `flag=revoked` in DNS
 - Relying parties MUST reject revoked device keys immediately
 - Does NOT require the device itself — solves lost/stolen device problem
@@ -189,8 +191,9 @@ After TLS is established, both sides prove identity using the same Ed25519 chall
       Server                                        Client
         |                                              |
   [1]   |  ServerHello                                 |
-        |  { server_uid, kid, nonce_s }                |
-        |  + sig = Sign(server_key, nonce_s|timestamp) |
+        |  { server_uid, kid, nonce_s(16B) }           |
+        |  + sig = Sign(server_key,                    |
+        |      nonce_s + 0x00 + timestamp)             |
         |--------------------------------------------->|
         |                                              |
         |              Client verifies server sig      |
@@ -198,9 +201,10 @@ After TLS is established, both sides prove identity using the same Ed25519 chall
         |              Checks TOFU pin                  |
         |                                              |
   [2]   |                            ClientHello       |
-        |  { user_uid, kid, nonce_c }                  |
-        |  + sig = Sign(device_key, nonce_s|nonce_c|   |
-        |          server_uid|timestamp)               |
+        |  { user_uid, kid, nonce_c(16B) }             |
+        |  + sig = Sign(device_key,                    |
+        |      nonce_s + 0x00 + nonce_c + 0x00 +       |
+        |      server_uid + 0x00 + timestamp)          |
         |<---------------------------------------------|
         |                                              |
         |  Server verifies device key sig              |
@@ -214,11 +218,12 @@ After TLS is established, both sides prove identity using the same Ed25519 chall
 ```
 
 **Requirements:**
-- Both nonces MUST include >=16 random bytes.
+- Both nonces MUST be exactly 16 random bytes. Implementations MUST reject handshake messages with nonces of any other length.
 - Client signature MUST bind to server_uid and server nonce to prevent replay and relay attacks.
-- Timestamps MUST be within 5 minutes.
-- All signatures use Ed25519 over the canonical byte representation.
+- Timestamps MUST be exactly 20 characters in ISO 8601 format (`YYYY-MM-DDTHH:MM:SSZ`) and within 5 minutes of current time.
+- All signatures use Ed25519 over the canonical byte representation with null-byte (`0x00`) separators between fields. See [DNS-RECORDS-SPEC.md §3.7](DNS-RECORDS-SPEC.md#37-enrollment-signature-verification) for the canonical message format.
 - Client MUST use a device key, never the root key, for authentication signatures.
+- Implementations MUST reject any handshake message exceeding **512 bytes** total to prevent denial-of-service via oversized payloads.
 
 ### 5.2 Anonymous / Lightweight Connection
 
@@ -302,7 +307,7 @@ The SSO is **stateless with respect to identity**:
 4.  Client computes opaque device key ID:
       device_kid = hex(BLAKE2b(device_public_key))[0:8]   (e.g., "a7f3b2c1")
 5.  Root key signs device enrollment:
-      enroll_sig = Sign(root_key, "enroll"|uid|device_kid|device_pk|timestamp)
+      enroll_sig = Sign(root_key, "enroll" 0x00 uid 0x00 device_kid 0x00 device_pk 0x00 timestamp)
 6.  Client encrypts device name for DNS (sealed box to root public key):
       encrypted_device_name = SealedBox(root_x25519_pk, "ryan-desktop")
       See DNS-RECORDS-SPEC.md §3.4 for encrypted device name format

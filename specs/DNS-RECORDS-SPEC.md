@@ -1,10 +1,12 @@
-# DNS Record Reference — v0.4
+# DNS Record Reference — v0.5
 
 **Status:** Draft
 **Parent document:** [IDENTITY-SPEC.md](IDENTITY-SPEC.md)
 **Companion documents:** [RECOVERY-SPEC.md](RECOVERY-SPEC.md)
 
 This document is the **normative reference** for all DNS record types in the MeatSpeak identity system. It defines record formats, field semantics, encoding rules, TTL strategy, and HTTPS fallback endpoints. Keep this open while coding.
+
+**Changes from v0.4:** Added §1.2a Field Size Constraints table with strict max sizes for every field. All signature constructions now use null-byte (`0x00`) separators to prevent field boundary ambiguity. Device key IDs strictly 8 hex chars. Sealed box plaintexts capped at 64 bytes. Timestamps fixed to exactly 20 chars. Durations capped at 365d. Handle input capped at 128 chars pre-normalization. Migration domain capped at 253 chars (DNS limit).
 
 ---
 
@@ -19,11 +21,39 @@ All identity records live under a configurable **identity domain**, e.g. `id.exa
 | Encoding | Used For | Rules |
 |----------|----------|-------|
 | Base64url | Public keys, signatures, ciphertext, sealed boxes | [RFC 4648 §5](https://datatracker.ietf.org/doc/html/rfc4648#section-5). No padding (`=`). Alphabet: `A-Za-z0-9-_`. |
-| ISO 8601 | Timestamps | UTC, full precision: `YYYY-MM-DDTHH:MM:SSZ`. Always include the `Z` suffix. |
-| Crockford Base32 | UIDs (ULID) | 26 characters, lowercase in DNS labels. Alphabet: `0-9a-hjkmnp-tv-z`. |
-| Duration | Window fields | Integer followed by unit: `d` (days), `h` (hours). Example: `14d`, `60d`. |
+| ISO 8601 | Timestamps | UTC, exactly 20 characters: `YYYY-MM-DDTHH:MM:SSZ`. No subsecond precision. Always include the `Z` suffix. Implementations MUST reject timestamps in any other format. |
+| Crockford Base32 | UIDs (ULID) | Exactly 26 characters, lowercase in DNS labels. Alphabet: `0-9a-hjkmnp-tv-z`. |
+| Duration | Window fields | 1-3 digit integer followed by unit: `d` (days). Range: `1d` to `365d`. Example: `14d`, `60d`. Implementations MUST reject values outside this range. |
 
 All field values are UTF-8 strings. Semicolons (`;`) and equals signs (`=`) MUST NOT appear in field values.
+
+### 1.2a Field Size Constraints
+
+Every field in a DNS TXT record MUST respect strict size limits to prevent oversized records, parsing ambiguity, and denial-of-service via large payloads. Implementations MUST reject any record where a field exceeds these limits.
+
+| Field | Fixed/Max Size | Notes |
+|-------|---------------|-------|
+| `v` | 1 char | Currently `1`. Single digit. |
+| `k` | 7 chars | Currently `ed25519`. |
+| `kid` | Exactly 8 hex chars (device), max 12 chars (root/server) | See §3.5. |
+| `pk` | 43 chars | Ed25519: 32 bytes = 43 chars Base64url. |
+| `sig`, `enroll_sig` | 86 chars | Ed25519: 64 bytes = 86 chars Base64url. |
+| `device` (sealed box) | Max 152 chars | Plaintext max 64 bytes + 48 bytes overhead = 112 bytes = 150 chars Base64url. |
+| `name` (sealed box) | Max 152 chars | Same: 64-byte plaintext limit. |
+| `rcid` (sealed box) | Max 150 chars | Contains 64-byte signature + 48 bytes overhead = 112 bytes = 150 chars Base64url. |
+| `uid` | 26 chars | ULID, Crockford Base32. |
+| `flag` | Max 24 chars | Comma-separated, longest valid combo: `primary,contested`. |
+| `type` | Max 6 chars | `user`, `server`, or `idp`. |
+| `window`, `death_window` | Max 4 chars | `1d` to `365d`. |
+| `issuer` | Max 256 chars | HTTPS URL. |
+| `jwks` | Max 128 chars | Relative path. |
+| `to` (migration domain) | Max 253 chars | DNS name limit ([RFC 1035](https://datatracker.ietf.org/doc/html/rfc1035)). |
+| Timestamps (`ts`, `exp`, `effective`, `expires`) | Exactly 20 chars | `YYYY-MM-DDTHH:MM:SSZ`. |
+
+**Sealed box plaintext limits:**
+- Device names: max **64 bytes** UTF-8 (e.g., "ryan-desktop" is 12 bytes — plenty of room).
+- RC friendly names: max **64 bytes** UTF-8 (e.g., "Tara" is 4 bytes).
+- Implementations MUST reject sealed boxes that decode to plaintext exceeding these limits.
 
 ### 1.3 TXT Record Size Limits
 
@@ -89,8 +119,8 @@ _idp.<domain>  TXT  "v=1;issuer=https://<domain>;jwks=/.well-known/jwks.json"
 | Field    | Required | Type   | Description |
 |----------|----------|--------|-------------|
 | `v`      | Yes      | Integer | Spec version. Currently `1`. |
-| `issuer` | Yes      | URL    | Canonical HTTPS origin of the identity provider. No trailing slash. |
-| `jwks`   | No       | Path   | Path to JWKS endpoint, relative to `issuer`. Default: `/.well-known/jwks.json`. |
+| `issuer` | Yes      | URL    | Canonical HTTPS origin of the identity provider. No trailing slash. Max 256 chars. |
+| `jwks`   | No       | Path   | Path to JWKS endpoint, relative to `issuer`. Default: `/.well-known/jwks.json`. Max 128 chars. |
 
 ### 2.3 Examples
 
@@ -126,7 +156,7 @@ _idp.id.example.org.  3600  IN  TXT  "v=1;issuer=https://id.example.org;jwks=/au
 |--------------|----------|-------------|-------------|
 | `v`          | Yes      | Integer     | Spec version. Currently `1`. |
 | `k`          | Yes      | String      | Key algorithm. MUST be `ed25519`. |
-| `kid`        | Yes      | String      | Key identifier. For device keys: MUST be opaque (e.g., first 8 hex chars of `BLAKE2b(pk)`). For root keys: MAY use `root-YYYY` format. See §3.5. |
+| `kid`        | Yes      | String      | Key identifier. For device keys: MUST be exactly 8 lowercase hex chars of `BLAKE2b(pk)`. For root keys: `root-YYYY` format (9 chars). Max 12 chars. See §3.5. |
 | `pk`         | Yes      | Base64url   | Ed25519 public key (32 bytes encoded). |
 | `exp`        | No       | ISO 8601    | Expiry hint. Advisory only — implementations SHOULD warn but MAY still accept. |
 | `flag`       | No       | String      | Comma-separated flags. See §3.5. |
@@ -160,9 +190,11 @@ Device keys are per-device Ed25519 keypairs used for all authentication. They in
 device = Base64url(SealedBox(root_x25519_pk, "ryan-desktop"))
 ```
 
+**Plaintext limit:** Device names MUST be at most **64 bytes** UTF-8. This produces a sealed box of at most 112 bytes (64 + 48 overhead) = ~150 chars Base64url. Implementations MUST reject device name plaintexts exceeding 64 bytes.
+
 **Why encrypt?** Plaintext device names like `device=ryan-desktop` leak information about the user's hardware and habits. Encrypted names are opaque to all observers; only the user (with their root key) can see which device is which.
 
-**Opaque key IDs:** The `kid` field for device keys MUST be opaque to prevent leaking device information through the key identifier. Recommended: first 8 hex characters of `BLAKE2b(pk)`.
+**Opaque key IDs:** The `kid` field for device keys MUST be exactly 8 lowercase hex characters derived from `BLAKE2b(pk)`. See §3.5 for all key ID conventions.
 
 **Example:**
 ```
@@ -186,13 +218,13 @@ Flags are comma-separated when multiple apply: `flag=primary,rotate`.
 
 **Key ID conventions:**
 
-| Key Type | `kid` Format | Example |
-|----------|-------------|---------|
-| Root key | `root-YYYY` or `root-YYYY-MM` | `root-2026` |
-| Device key | First 8 hex chars of `BLAKE2b(pk)` | `a7f3b2c1` |
-| Server key | `YYYY-MM` or short slug | `2026-02`, `srv-2026` |
+| Key Type | `kid` Format | Length | Example |
+|----------|-------------|--------|---------|
+| Root key | `root-YYYY` | 9 chars (fixed) | `root-2026` |
+| Device key | First 8 hex chars of `BLAKE2b(pk)` | 8 chars (fixed) | `a7f3b2c1` |
+| Server key | `srv-YYYY` or `YYYY-MM` | Max 12 chars | `srv-2026`, `2026-02` |
 
-Device key IDs MUST be opaque to prevent leaking device information. Implementations MUST NOT use descriptive names like `desktop-2026` or `phone-2026` as key IDs.
+Device key IDs MUST be exactly 8 lowercase hexadecimal characters derived from `BLAKE2b(pk)`. Implementations MUST reject device key records with `kid` values that don't match this format. Descriptive names like `desktop-2026` or `phone-2026` MUST NOT be used — they leak device information and violate the fixed-length requirement.
 
 ### 3.6 Multiple Keys on One Label
 
@@ -223,11 +255,11 @@ An observer sees: one root key and two device keys. They cannot determine what d
 The `enroll_sig` field proves the root key authorized a device key. Verification steps:
 
 1. Extract the root key from the same `_k` label (the record with `flag=root`).
-2. Construct the enrollment message:
+2. Construct the enrollment message using null-byte (`0x00`) separators:
    ```
-   message = "enroll" | uid | device_kid | device_pk | timestamp
+   message = "enroll" 0x00 uid 0x00 device_kid 0x00 device_pk 0x00 timestamp
    ```
-   Where `|` is byte concatenation using the raw UTF-8 bytes of each field.
+   All text fields are UTF-8 encoded. `device_pk` is the raw 32-byte public key. The null-byte separator prevents field boundary confusion between variable-length fields.
 3. Decode `enroll_sig` from Base64url.
 4. Verify: `Ed25519.Verify(root_public_key, message, enroll_sig)`.
 
@@ -236,12 +268,17 @@ The `enroll_sig` field proves the root key authorized a device key. Verification
 bool VerifyEnrollment(byte[] rootPk, string uid, string deviceKid,
                       byte[] devicePk, string timestamp, byte[] enrollSig)
 {
-    // Construct canonical message
+    var sep = new byte[] { 0x00 };
+
     var message = Encoding.UTF8.GetBytes("enroll")
-        .Concat(Encoding.UTF8.GetBytes(uid))
-        .Concat(Encoding.UTF8.GetBytes(deviceKid))
-        .Concat(devicePk)
-        .Concat(Encoding.UTF8.GetBytes(timestamp))
+        .Concat(sep)
+        .Concat(Encoding.UTF8.GetBytes(uid))       // 26 chars
+        .Concat(sep)
+        .Concat(Encoding.UTF8.GetBytes(deviceKid))  // 8 hex chars
+        .Concat(sep)
+        .Concat(devicePk)                            // 32 bytes
+        .Concat(sep)
+        .Concat(Encoding.UTF8.GetBytes(timestamp))   // 20 chars
         .ToArray();
 
     return Ed25519.Verify(rootPk, message, enrollSig);
@@ -371,7 +408,8 @@ Handles are human-readable identifiers mapped to UIDs. Before use as a DNS label
 **Edge cases:**
 - Empty handle after normalization: invalid, MUST be rejected.
 - Handle that normalizes to a pure number: valid (UIDs use a different subdomain).
-- Maximum length: 63 characters (DNS label limit).
+- Maximum input length before normalization: 128 characters. Implementations MUST reject longer inputs without processing.
+- Maximum output length after normalization: 63 characters (DNS label limit).
 - Handles containing only stripped characters: invalid after normalization.
 
 ### 5.4 Examples
@@ -408,23 +446,23 @@ Handle mappings are **publicly enumerable**. Anyone who can query DNS can discov
 | Field | Required | Type      | Description |
 |-------|----------|-----------|-------------|
 | `v`   | Yes      | Integer   | Spec version. Currently `1`. |
-| `to`  | Yes      | Domain    | New identity domain the user is migrating to. |
+| `to`  | Yes      | Domain    | New identity domain the user is migrating to. Max 253 chars (DNS name limit). |
 | `ts`  | Yes      | ISO 8601  | Timestamp of migration statement. |
 | `sig` | Yes      | Base64url | Ed25519 signature proving migration is authorized by the key holder. |
 
 ### 6.3 Signature Construction
 
-The `sig` field is constructed by signing the canonical migration message with the user's root key:
+The `sig` field is constructed by signing the canonical migration message with the user's root key, using null-byte (`0x00`) separators:
 
 ```
-message = uid | to | ts
+message = "migrate" 0x00 uid 0x00 to 0x00 ts
 ```
 
-Where `|` is byte concatenation of the raw UTF-8 string values. The signature proves the key holder (not the domain operator) authorized the migration.
+The `"migrate"` prefix prevents cross-protocol signature reuse. Null-byte separators prevent field boundary confusion (the `to` domain is variable-length). The signature proves the key holder (not the domain operator) authorized the migration.
 
 **Step-by-step:**
-1. Encode each field as UTF-8 bytes: `uid_bytes`, `to_bytes`, `ts_bytes`.
-2. Concatenate: `message = uid_bytes + to_bytes + ts_bytes`.
+1. Encode each field as UTF-8 bytes.
+2. Concatenate with `0x00` separator: `message = "migrate" + 0x00 + uid + 0x00 + to + 0x00 + ts`.
 3. Sign: `sig = Ed25519.Sign(root_private_key, message)`.
 4. Encode signature as Base64url (no padding).
 
@@ -476,18 +514,22 @@ Recovery contact records use **blind RCIDs** — the recovery contact's identity
 The `rcid` field is a sealed box containing the root key's authorization signature, encrypted to the recovery contact's public key:
 
 ```
-authorization = Sign(root_key, "recover" || uid || rc_pk || window || death_window || timestamp)
+auth_message = "recover" 0x00 uid 0x00 rc_pk 0x00 window 0x00 death_window 0x00 timestamp
+authorization = Sign(root_key, auth_message)
 rcid = SealedBox(rc_x25519_pk, authorization)
 ```
 
+Null-byte (`0x00`) separators prevent field boundary confusion between the variable-length `window` and `death_window` fields.
+
 **Step-by-step (at designation time):**
 1. The user knows the RC's Ed25519 public key.
-2. Sign the authorization: `auth_sig = Sign(root_key, "recover" || uid || rc_pk || window || death_window || timestamp)`.
-3. Convert the RC's Ed25519 public key to X25519.
-4. Seal: `rcid = crypto_box_seal(auth_sig, rc_x25519_pk)`.
-5. Encode as Base64url.
+2. Construct the authorization message with null-byte separators.
+3. Sign: `auth_sig = Sign(root_key, auth_message)` (64 bytes).
+4. Convert the RC's Ed25519 public key to X25519.
+5. Seal: `rcid = crypto_box_seal(auth_sig, rc_x25519_pk)` (112 bytes = 64 + 48 overhead).
+6. Encode as Base64url (150 chars).
 
-**What's inside the RCID:** The root key's Ed25519 signature over a message that binds the RC's public key to this user's recovery authorization. Only the RC can extract this signature.
+**What's inside the RCID:** The root key's Ed25519 signature (64 bytes) over a message that binds the RC's public key to this user's recovery authorization. Only the RC can extract this signature.
 
 ### 7.4 RC Verification Flow
 
@@ -504,8 +546,8 @@ RC                                         Identity Server
   |--------------------------------------------->|
   |                                              |
   |   Server reconstructs the signed message:    |
-  |   "recover" || uid || presented_pk ||        |
-  |   window || death_window || timestamp        |
+  |   "recover" 0x00 uid 0x00 presented_pk      |
+  |   0x00 window 0x00 death_window 0x00 ts      |
   |                                              |
   |   Verify(root_pk, root_sig, message) ✓       |
   |   -> Root key authorized this pk as RC       |
@@ -529,6 +571,8 @@ The `name` field is a sealed box encrypted to the user's root public key:
 ```
 name = SealedBox(user_root_x25519_pk, "Tara")
 ```
+
+**Plaintext limit:** RC friendly names MUST be at most **64 bytes** UTF-8. This produces a sealed box of at most 112 bytes = ~150 chars Base64url. Implementations MUST reject name plaintexts exceeding 64 bytes.
 
 This lets the user decrypt and see a friendly name for each RC. Essential when multiple RCs are designated (future M-of-N), as the RCIDs themselves are indistinguishable.
 
@@ -579,10 +623,10 @@ An observer sees: 3 opaque blobs. Cannot determine who any of them are. Even the
 ### 8.3 Signature Construction
 
 ```
-message = "rc_change" | uid | old_rcid | new_rcid | timestamp
+message = "rc_change" 0x00 uid 0x00 old_rcid 0x00 new_rcid 0x00 timestamp
 ```
 
-Signed with the root key using byte-concatenation. The `old_rcid` and `new_rcid` are included as their raw Base64url string bytes.
+Signed with the root key. Null-byte (`0x00`) separators prevent field boundary confusion between the variable-length `old_rcid` and `new_rcid` values. The RCID values are included as their Base64url string bytes (as they appear in the DNS record).
 
 ### 8.4 Lifecycle: Pending, Effective, Removed
 
